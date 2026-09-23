@@ -15,6 +15,7 @@ Borrowed payloads (deliberate, reported in the run summary):
                      tensors matched at cosine >= 0.99966 with the seven norms BIT-IDENTICAL.
   frontend/*    6 -- tokenizer and friends.
   text/draft_head(+_token_ids) -- frequency shortlist; same tokenizer => same shortlist.
+  dflash2/*    66 -- optional companion; kept unless filtered out (see --skip-*).
 
 Modes
   check            geometry + decode + byte-round-trip proofs (no writes)
@@ -22,13 +23,18 @@ Modes
   build  <out>     full text model
 
 Paths (both may be overridden; the constants in this file are only defaults)
-  --gguf     <p>   the Bonsai 2 27B PQ2_0 GGUF          (env NINFER_TERNARY_GGUF)
+  --gguf     <p>   the Bonsai 2 27B PQ2_0 or PTQ1_0 GGUF (env NINFER_TERNARY_GGUF)
   --template <p>   a **groupwise-int** qwen3.8-27b artifact
                    (env NINFER_TERNARY_TEMPLATE)       -- see README FAQ
   The template is the skeleton/manifest this packer walks, not just a donor of the
   vision/MTP payloads: its object NAMES must match the mapping table, so the `nvfp4`
   packing (fused gdn/a_b_projection, gdn/query_key_value_z, attention/query_key_gate_value)
   is rejected up front with instructions on how to produce the right one.
+
+Inventory filters (build only; env NINFER_TERNARY_SKIP_VISION/SKIP_MTP/SKIP_DFLASH2=1)
+  --skip-vision    omit vision/* (333 objects) — text-only / small-VRAM targets
+  --skip-mtp       omit mtp/* (12 objects) — no speculative draft head
+  --skip-dflash2   omit dflash2/* (66 objects) — only if the engine path does not bind them
 
 Interpreter: <PYTHON>\\python.exe
 """
@@ -61,6 +67,12 @@ from tools.artifact import (  # noqa: E402
 # 两个路径都没有可用默认值：用 --template / --gguf 或环境变量显式给出。
 TEMPLATE = ""
 GGUF = ""
+
+# 对象表裁剪（仅影响 build；check 始终用完整模板清单做映射自检）。
+# 4060 8G 文本路径默认可裁 vision/mtp；dflash2 默认保留（本线血统含 DFlash 绑定）。
+SKIP_VISION = False
+SKIP_MTP = False
+SKIP_DFLASH2 = False
 
 # The template must be the **groupwise-int** packing.  It is not merely a donor of the
 # vision/MTP payloads: this packer walks the template's OWN object list and maps every name
@@ -814,9 +826,27 @@ def mode_check(g: Gguf) -> int:
         back = disassemble_ternary(fmt, (n, k), payload)
         src = g.payload(name)
         byte_ok = back == src
-        a, b = DEQUANT[tt](src), DEQUANT[tt](back)
-        dec_ok = bool(np.array_equal(a, b))
-        zeros = float(np.mean(a == 0.0))
+        # 全量反量化在 token_embd（248320×5120）上会一次要约 4.7 GiB；
+        # 按 GGUF 块行分片：单片 float32 输出约 64 MiB（1<<17 组），比较仍是整表逐元素相等。
+        block_b = 28 if tt == T_PTQ1_0 else 34
+        gpr = k // 128
+        row_b = gpr * block_b
+        n_g = n
+        max_groups = 1 << 17
+        rows_per = max(1, min(n_g, max_groups // max(gpr, 1)))
+        dec_ok = True
+        zeros_acc, w_count = 0.0, 0
+        for r0 in range(0, n_g, rows_per):
+            r1 = min(n_g, r0 + rows_per)
+            sa, sb = src[r0 * row_b:r1 * row_b], back[r0 * row_b:r1 * row_b]
+            da, db = DEQUANT[tt](sa), DEQUANT[tt](sb)
+            if not np.array_equal(da, db):
+                dec_ok = False
+                break
+            zeros_acc += float(np.sum(da == 0.0))
+            w_count += da.size
+            del da, db
+        zeros = zeros_acc / w_count if w_count else float("nan")
 
         # OFFSET SELF-CHECK -- the decisive one.  bytes_equal only proves the assembly is
         # self-consistent; reading a wrong file offset would ALSO give bytes_equal, because
@@ -824,10 +854,14 @@ def mode_check(g: Gguf) -> int:
         # scale is a tight positive cluster (few distinct high bytes, all finite, none
         # negative), whereas a mis-placed read draws scale words from arbitrary positions and
         # looks like a uniform uint16 sample with many NaN/inf and negative values.
-        arr = np.frombuffer(src, dtype=np.uint8).reshape(-1, 34)
-        words = arr[:, 0:2].copy().view(np.uint16).reshape(-1)
+        # Block layout differs by format: PQ2_0 = scale||base (34 B), PTQ1_0 = base||high||scale (28 B).
+        block_b = 28 if fmt == "PTQ1_0_G128" else 34
+        scale_off = 26 if fmt == "PTQ1_0_G128" else 0
+        arr = np.frombuffer(src, dtype=np.uint8).reshape(-1, block_b)
+        scale_view = arr[:, scale_off:scale_off + 2]
+        words = scale_view.copy().view(np.uint16).reshape(-1)
         hi_distinct = int(np.unique((words >> 8).astype(np.uint8)).size)
-        d = arr[:, 0:2].copy().view(np.float16).astype(np.float32).reshape(-1)
+        d = scale_view.copy().view(np.float16).astype(np.float32).reshape(-1)
         fin = np.isfinite(d)
         n_nonfinite = int(np.sum(~fin))
         n_neg = int(np.sum(fin & (d < 0)))
@@ -875,6 +909,17 @@ def mode_check(g: Gguf) -> int:
     return 0 if ok else 1
 
 
+def _drop_filtered(name: str) -> bool:
+    """build 阶段按前缀丢弃对象；返回 True 表示丢弃。"""
+    if SKIP_VISION and name.startswith("vision/"):
+        return True
+    if SKIP_MTP and name.startswith("mtp/"):
+        return True
+    if SKIP_DFLASH2 and name.startswith("dflash2/"):
+        return True
+    return False
+
+
 def mode_build(g: Gguf, out: str, only_layer: int | None = None) -> int:
     p = Packer(g)
     keep = None
@@ -888,6 +933,7 @@ def mode_build(g: Gguf, out: str, only_layer: int | None = None) -> int:
                 names.add(n)
         keep = names
 
+    skipped = Counter()
     specs = []
     chosen = []
     for o in p.objects + [
@@ -897,6 +943,9 @@ def mode_build(g: Gguf, out: str, only_layer: int | None = None) -> int:
          "format": "I32", "layout": "contiguous-le-v1"},
     ]:
         if keep is not None and o["name"] not in keep:
+            continue
+        if _drop_filtered(o["name"]):
+            skipped[o["name"].split("/")[0]] += 1
             continue
         if o["kind"] == "tensor":
             fmt, layout = p.target_format(o["name"])
@@ -938,6 +987,8 @@ def mode_build(g: Gguf, out: str, only_layer: int | None = None) -> int:
     print(f"  borrowed payloads : {borrowed_bytes:>15,} B = {borrowed_bytes / 2**30:.3f} GiB "
           f"{dict(borrowed)}")
     print(f"  objects           : {len(chosen)}")
+    if skipped:
+        print(f"  skipped (filters) : {dict(skipped)}")
     return 0
 
 
@@ -956,11 +1007,32 @@ def _pop_opt(args, name):
     return val, rest
 
 
+def _pop_flag(args, name):
+    """Remove a boolean flag `--name` from args; return (present, rest)."""
+    rest, found = [], False
+    for a in args:
+        if a == name:
+            found = True
+        else:
+            rest.append(a)
+    return found, rest
+
+
+def _env_flag(key: str) -> bool:
+    return os.environ.get(key, "").strip().lower() in ("1", "true", "yes", "on")
+
+
 def main() -> int:
-    global TEMPLATE, GGUF
+    global TEMPLATE, GGUF, SKIP_VISION, SKIP_MTP, SKIP_DFLASH2
     args = sys.argv[1:]
     tpl_opt, args = _pop_opt(args, "--template")
     gguf_opt, args = _pop_opt(args, "--gguf")
+    flag, args = _pop_flag(args, "--skip-vision")
+    SKIP_VISION = flag or _env_flag("NINFER_TERNARY_SKIP_VISION")
+    flag, args = _pop_flag(args, "--skip-mtp")
+    SKIP_MTP = flag or _env_flag("NINFER_TERNARY_SKIP_MTP")
+    flag, args = _pop_flag(args, "--skip-dflash2")
+    SKIP_DFLASH2 = flag or _env_flag("NINFER_TERNARY_SKIP_DFLASH2")
     TEMPLATE = tpl_opt or os.environ.get("NINFER_TERNARY_TEMPLATE") or TEMPLATE
     GGUF = gguf_opt or os.environ.get("NINFER_TERNARY_GGUF") or GGUF
     if not args:
@@ -984,6 +1056,15 @@ def main() -> int:
     if args[0] == "layer3":
         return mode_build(g, args[1], only_layer=3)
     if args[0] == "build":
+        filters = []
+        if SKIP_VISION:
+            filters.append("vision")
+        if SKIP_MTP:
+            filters.append("mtp")
+        if SKIP_DFLASH2:
+            filters.append("dflash2")
+        if filters:
+            print(f"build filters: omit {', '.join(filters)}")
         return mode_build(g, args[1])
     print(f"unknown mode {args[0]}")
     return 2
