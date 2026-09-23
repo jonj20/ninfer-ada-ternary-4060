@@ -1,8 +1,8 @@
 """资产定位：同一套代码要同时服务仓库检出与已安装的 wheel。
 
-仓库里打包器在 tools/、补丁在 patches/、引擎可执行文件在构建目录；安装之后这些内容被
-塞进包内的 _data/ 下。把这个差异收敛到本模块，其余代码只问"路径在哪"，不问"我在哪种
-形态里运行"。
+仓库里打包器在 tools/、引擎源码在 src/（三元改动已合入，无独立 patches/）、可执行文件在
+构建目录；安装之后这些内容被塞进包内的 _data/ 下。把这个差异收敛到本模块，其余代码只问
+"路径在哪"，不问"我在哪种形态里运行"。
 """
 
 from __future__ import annotations
@@ -62,13 +62,23 @@ def repo_root() -> Path:
 
 
 def patches_root() -> Path:
-    """返回补丁数据目录（manifest.json 与 changed-files）。
+    """返回补丁/清单数据目录（manifest.json、changed-files、聚合 diff）。
+
+    源码合入本仓后 patches/ 已删除；manifest.json 与聚合补丁在仓根。
+    安装形态优先随包副本。
 
     Returns:
-        补丁目录路径。安装形态取随包副本，仓库形态取仓库里的 patches/。
+        数据目录路径：bundled patches/ → 仓内 patches/ → 仓根（含 manifest.json 时）。
     """
     bundled = bundled_data_dir() / "patches"
-    return bundled if bundled.is_dir() else repo_root() / "patches"
+    if bundled.is_dir():
+        return bundled
+    repo_patches = repo_root() / "patches"
+    if repo_patches.is_dir():
+        return repo_patches
+    if (repo_root() / "manifest.json").is_file():
+        return repo_root()
+    return repo_patches
 
 
 def pack_dir() -> Path:

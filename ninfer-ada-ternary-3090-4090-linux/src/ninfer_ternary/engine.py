@@ -1,8 +1,11 @@
-"""拉取上游 ninfer、打上三元补丁、自检、编译，并把临时树清干净。
+"""在树内或临时检出上自检并编译 ninfer 引擎。
+
+源码与三元改动已合入本仓（无 patches/ 快照）：默认从仓根就地 cmake，不再 clone/打补丁。
+仅当显式给出 NINFER_TERNARY_SOURCE 或仓根不是合法源码树时，才退回旧的「克隆 → 落补丁」路径。
 
 这条流程有两个调用方：wheel 构建后端（uv tool install 时自动跑）与仓库内的
-build-engine 子命令。两者的纪律一致 —— 克隆出来的源码树、CMake 构建目录、编译子进程的
-临时文件全部落在 $TMPDIR/ninfer-ternary 这一个根下，用完即删；只有最终的可执行文件被拷走。
+build-engine 子命令。临时物（若有）落在 $TMPDIR/ninfer-ternary 下，用完即删；只有最终
+可执行文件被拷走。
 """
 
 from __future__ import annotations
@@ -16,6 +19,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Mapping, Sequence
 
+from . import assets
 from .assets import ENGINE_PROGRAMS
 from .checks import check_all
 from .manifest import PatchManifest, changed_files_root, default_manifest_path
@@ -150,8 +154,11 @@ class BuildRequest:
     def from_environment(cls, manifest: PatchManifest) -> "BuildRequest":
         """按环境变量构造请求。
 
+        未显式设置 NINFER_TERNARY_SOURCE 且本仓根是合法引擎树时，source 默认指向仓根
+        （树内一体，不 clone）。
+
         Args:
-            manifest: 补丁清单，提供默认的仓库地址与提交。
+            manifest: 清单，提供默认的仓库地址与提交（仅旧 clone 路径使用）。
 
         Returns:
             构造好的请求。
@@ -164,12 +171,18 @@ class BuildRequest:
             raise EngineError(f"{ARCH_ENV} 只能是 86 或 89，实际为 {arch}")
         source = os.environ.get(SOURCE_ENV, "").strip()
         scratch = os.environ.get(SCRATCH_ENV, "").strip()
+        if source:
+            source_path: Path | None = Path(source).expanduser().resolve()
+        elif _is_engine_tree(assets.repo_root()):
+            source_path = assets.repo_root()
+        else:
+            source_path = None
         return cls(
             repository=os.environ.get(TARGET_REPO_ENV, "").strip() or manifest.target_repository,
             commit=manifest.target_commit,
             arch=arch,
             jobs=_positive_int(JOBS_ENV, os.cpu_count() or 8),
-            source=Path(source).expanduser().resolve() if source else None,
+            source=source_path,
             scratch=Path(scratch).expanduser().resolve() if scratch else None,
             keep=_flag(KEEP_ENV),
             run_tests=_flag(TESTS_ENV),
@@ -219,8 +232,26 @@ def _fetch(repository: str, commit: str, dest: Path) -> None:
         _run(["git", "-C", str(dest), "checkout", "--quiet", "--detach", commit])
 
 
+def _is_engine_tree(path: Path) -> bool:
+    """判断路径是否是可配置的 ninfer 源码树（树内一体构建的前提）。
+
+    Args:
+        path: 候选根目录。
+
+    Returns:
+        同时含 CMakeLists.txt、src/、tools/artifact 时为 True。
+    """
+    return (
+        (path / "CMakeLists.txt").is_file()
+        and (path / "src").is_dir()
+        and (path / "tools" / "artifact").is_dir()
+    )
+
+
 def _land(source: Path) -> tuple[int, int]:
-    """把补丁落到源码树并做落地自检。
+    """把补丁落到源码树（若仍有快照）并做落地自检。
+
+    树内一体时不存在 changed-files：跳过覆盖写入，只跑 check_all。
 
     Args:
         source: 目标源码树。
@@ -231,9 +262,13 @@ def _land(source: Path) -> tuple[int, int]:
     Raises:
         EngineError: 自检未全通过。
     """
-    manifest = PatchManifest.load(default_manifest_path())
-    report = apply_patch_set(source, manifest, changed_files_root(), force=True)
-    _LOGGER.info("落地补丁: files=%d", len(report.results))
+    snapshot = changed_files_root()
+    if snapshot.is_dir():
+        manifest = PatchManifest.load(default_manifest_path())
+        report = apply_patch_set(source, manifest, snapshot, force=True)
+        _LOGGER.info("落地补丁: files=%d", len(report.results))
+    else:
+        _LOGGER.info("树内一体构建，无 patches 快照，跳过覆盖: %s", source)
     findings = check_all(source)
     passed = sum(1 for item in findings if item.ok)
     if passed != len(findings):
@@ -393,12 +428,14 @@ def build_engine(
     *,
     assets_dir: Path | None = None,
 ) -> BuildResult:
-    """完整走一遍拉取、打补丁、自检、编译，并把可执行文件交到目标目录。
+    """自检并编译引擎，把可执行文件交到目标目录。
+
+    source 已是引擎树（默认仓根）时就地 cmake；否则按旧路径 clone → 落补丁 → 编译。
 
     Args:
         destination: 可执行文件的落点目录。
         request: 构建请求。
-        assets_dir: 需要一并收集上游 Python 模块时的落点目录。
+        assets_dir: 需要一并收集 tools/artifact 时的落点目录。
 
     Returns:
         构建结果。
@@ -406,16 +443,24 @@ def build_engine(
     Raises:
         EngineError: 任一阶段失败；临时目录仍会按 request.keep 处理。
     """
+    source = request.source
+    if source is None:
+        repo = assets.repo_root()
+        if _is_engine_tree(repo):
+            source = repo
+            _LOGGER.info("树内一体构建: %s", source)
+        else:
+            raise EngineError(
+                "未找到可构建的源码树。请设置 NINFER_TERNARY_SOURCE=<ninfer 检出>，"
+                "或在本仓根（含 CMakeLists.txt 与 src/）下运行。"
+            )
+    elif not _is_engine_tree(source):
+        raise EngineError(f"不是含 CMakeLists.txt、src/、tools/artifact 的源码树: {source}")
+
+    _LOGGER.info("源码树: %s", source)
     scratch = Path(tempfile.mkdtemp(prefix=_SCRATCH_PREFIX, dir=scratch_parent(request)))
     _LOGGER.info("临时目录: %s", scratch)
     try:
-        if request.source is not None:
-            source = request.source
-            _LOGGER.info("复用已有检出: %s", source)
-        else:
-            source = scratch / "source"
-            _LOGGER.info("拉取: %s@%s", request.repository, request.commit)
-            _fetch(request.repository, request.commit, source)
         passed, total = _land(source)
         programs = _compile(source, scratch / "build", request)
         if assets_dir is not None:

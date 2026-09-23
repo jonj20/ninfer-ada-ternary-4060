@@ -1,12 +1,12 @@
 """PEP 517 构建后端：让 uv tool install 一条命令就拿到编译好的引擎。
 
-标准后端只搬运 Python 文件，而本项目的卖点是"装完就能跑"，所以把编译搬进 build_wheel：
-克隆上游 → 落补丁 → 落地自检 → CMake/Ninja 编译 → 把可执行文件、上游制品读写模块与补丁
-一起打进 wheel → 删掉临时树。临时树落在 $TMPDIR/ninfer-ternary 下，除非显式要求保留。
+源码与三元改动已合入本仓：build_wheel 默认**树内 cmake**（仓根 → 临时构建目录 →
+可执行文件 + tools/artifact + pack 脚本打进 wheel），不再 clone/打 patches。
 
 环境变量：
     NINFER_TERNARY_SKIP_BUILD=1  只装 Python 侧，不编译，wheel 退化为纯 Python
-    NINFER_TERNARY_KEEP_BUILD=1  保留临时树，编译失败时排查用
+    NINFER_TERNARY_KEEP_BUILD=1  保留临时构建目录，编译失败时排查用
+    NINFER_TERNARY_SOURCE        覆盖源码树（默认本仓根）
     NINFER_TERNARY_TMPDIR        改写临时根目录，默认 $TMPDIR/ninfer-ternary
     其余见 ninfer_ternary.engine 的模块说明。
 """
@@ -53,8 +53,11 @@ _SDIST_ROOT_FILES = (
     "LICENSE",
     "NOTICE",
     "uv.lock",
+    "manifest.json",
+    "CMakeLists.txt",
 )
-_SDIST_ROOT_DIRS = ("src", "patches", "tools", "tests", "docs")
+# patches/ 已随源码合入删除；列表里保留名字也不会炸（_sdist_paths 跳过缺失目录）。
+_SDIST_ROOT_DIRS = ("src", "tools", "tests", "docs", "include", "apps", "cmake", "third_party")
 _SDIST_EXCLUDES = frozenset(
     {
         ".git",
@@ -272,6 +275,7 @@ def _collect(
     for path in _iter_tree(module_root):
         arcname = f"{_MODULE}/{path.relative_to(module_root).as_posix()}"
         members.append((arcname, path.read_bytes(), False))
+    # patches/ 已删除；若将来恢复快照目录仍打进 wheel。
     for path in _iter_tree(ROOT / "patches"):
         arcname = f"{_MODULE}/_data/patches/{path.relative_to(ROOT / 'patches').as_posix()}"
         members.append((arcname, path.read_bytes(), False))
@@ -388,12 +392,42 @@ def _assemble(
     )
 
 
+def _copy_artifact_module(source_root: Path, destination: Path) -> Path:
+    """把仓内 tools/artifact 拷到 destination（调用方传入 staging/upstream）。
+
+    Args:
+        source_root: 含 tools/artifact 的源码树根。
+        destination: 落点；须为 .../upstream，其下生成 tools/artifact。
+
+    Returns:
+        destination 本身。
+
+    Raises:
+        RuntimeError: 源码树缺少 tools/artifact。
+    """
+    import shutil
+
+    origin = source_root / "tools" / "artifact"
+    if not origin.is_dir():
+        raise RuntimeError(f"源码树缺少 tools/artifact: {origin}")
+    if destination.name != "upstream":
+        destination = destination / "upstream"
+    package = destination / "tools"
+    if package.exists():
+        shutil.rmtree(package)
+    shutil.copytree(origin, package / "artifact", ignore=shutil.ignore_patterns("__pycache__"))
+    (package / "__init__.py").write_text(
+        '"""随 wheel 分发的制品读写模块（来自本仓 tools/artifact）。"""\n', encoding="utf-8"
+    )
+    return destination
+
+
 def build_wheel(
     wheel_directory: str,
     config_settings: dict[str, Any] | None = None,
     metadata_directory: str | None = None,
 ) -> str:
-    """构建 wheel；默认在其中完成引擎的拉取、打补丁、编译与清理。
+    """构建 wheel；默认树内 cmake 编译引擎并打进包。
 
     Args:
         wheel_directory: wheel 的输出目录。
@@ -415,11 +449,16 @@ def build_wheel(
             upstream: Path | None = None
             if _flag(_SKIP_BUILD_ENV):
                 _LOGGER.warning("跳过引擎编译: %s=1", _SKIP_BUILD_ENV)
+                # 纯 Python wheel 仍带上仓内 tools/artifact，保证 ninfer-convert 可用。
+                upstream = staging / "upstream"
+                _copy_artifact_module(ROOT, upstream)
             else:
                 manifest = PatchManifest.load(default_manifest_path())
+                request = BuildRequest.from_environment(manifest)
+                # 树内一体：源码默认本仓根；from_environment 已处理。
                 result = build_engine(
                     staging / "bin",
-                    BuildRequest.from_environment(manifest),
+                    request,
                     assets_dir=staging,
                 )
                 binaries = dict(result.programs)
