@@ -1,10 +1,12 @@
 @echo off
 rem 一键编译 RTX 4060 (sm_89) -> build_4060\apps\ninfer.exe
 rem 用法: 双击或回车执行；参数 clean = 从零编译
+rem 低内存（7.6 GiB）档默认 -j1 防止 CUDA 单文件 OOM；NINFER_JOBS 可覆盖
 setlocal
 cd /d "%~dp0"
 set "MODE=%~1"
 if "%MODE%"=="" set "MODE=incremental"
+if not defined NINFER_JOBS set "NINFER_JOBS=1"
 
 set "ROOT=%CD%"
 set "BUILD=%ROOT%\build_4060"
@@ -25,8 +27,8 @@ if /i "%MODE%"=="clean" (
   cmake --build "%BUILD%" --target clean
 )
 
-echo ==^> build
-cmake --build "%BUILD%" -j
+echo ==^> build (jobs=%NINFER_JOBS%)
+cmake --build "%BUILD%" -j %NINFER_JOBS%
 if errorlevel 1 exit /b 1
 
 echo.

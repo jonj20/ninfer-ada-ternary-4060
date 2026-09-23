@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# 生成 text-only 三元 .ninfer（默认 PTQ1_0，裁 vision/mtp/dflash2）。
+# 生成 text-only 三元 .ninfer（默认 PTQ1_0，保留 mtp/vision、裁 dflash2）。
 # Linux/4060 入口；内部转调 tools/pack_text.py。
 #
 # 用法:

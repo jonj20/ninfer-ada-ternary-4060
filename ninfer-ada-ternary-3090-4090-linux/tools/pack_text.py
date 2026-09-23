@@ -1,12 +1,14 @@
 #!/usr/bin/env python3
-r"""生成 text-only 三元 `.ninfer` 制品（默认 PTQ1_0，裁 vision/mtp/dflash2）。
+r"""生成 text-only 三元 `.ninfer` 制品（默认 PTQ1_0，保留 mtp/vision、裁 dflash2）。
 
 面向 RTX 4060 8G 文本路径：先 `pack.py check`，再 `pack.py build`，并校验产物
 magic / identity / 对象前缀。路径可用环境变量或命令行覆盖；本机默认路径已写在
 脚本常量里（TEMPLATE/GGUF/OUT_DIR），无参即可跑。
 
-默认裁掉 vision/*、mtp/*、dflash2/*（显存紧、本期不做 DFlash 投机）；
-需要保留某段时用 --keep-vision / --keep-mtp / --keep-dflash2。
+默认裁剪：dflash2/*。**保留 mtp/* 与 vision/***：引擎绑定层对两者是"必选存在"
+（P4 实测，`features.mtp()/vision()` 只决定 Device vs ValidateOnly，缺对象即启动
+失败），故本脚本默认 keep；ddflash2 才是可选段。需要分开控制时用
+--skip-vision / --skip-mtp / --keep-dflash2。
 
 用法::
 
@@ -23,7 +25,7 @@ magic / identity / 对象前缀。路径可用环境变量或命令行覆盖；�
       --out /path/out.ninfer
 
 环境变量（命令行优先）：
-  PYTHON                   打包用解释器（默认优先 D:\David\python\python.exe，需 ≥3.10）
+  PYTHON                   打包用解释器（默认优先 D:\dev\python\python.exe，需 ≥3.10）
   NINFER_ROOT              可选：完整 ninfer 检出；不设则用本仓 tools/artifact 快照
   NINFER_TERNARY_TEMPLATE  覆盖默认模板路径
   NINFER_TERNARY_GGUF      覆盖默认 GGUF 路径
@@ -42,9 +44,9 @@ from pathlib import Path
 
 # 打包用根：默认本仓（tools/artifact 快照已在仓内）；可用 NINFER_ROOT 指完整检出。
 _DEFAULT_NINFER_ROOT = ""  # 空 = 用仓根
-_DEFAULT_TEMPLATE = r"D:\LLM\llama\qwen3_8_27b-v2.ninfer"
-_DEFAULT_GGUF = r"D:\LLM\llama\Ternary-Bonsai-2-27B-PTQ1_0.gguf"
-_DEFAULT_OUT_DIR = r"D:\LLM\ninfer-out"
+_DEFAULT_TEMPLATE = r"E:\gguf\qwen3.6-35b-a3b\qwen3_8_27b.ninfer"
+_DEFAULT_GGUF = r"E:\gguf\qwen3.6-35b-a3b\Ternary-Bonsai-2-27B-PTQ1_0.gguf"
+_DEFAULT_OUT_DIR = r"E:\gguf\qwen3.6-35b-a3b"
 
 _KIND_FILES = {
     "PTQ1_0": "Ternary-Bonsai-2-27B-PTQ1_0",
@@ -93,8 +95,8 @@ def _pick_python(preferred: str | None) -> str:
     env_py = os.environ.get("PYTHON")
     if env_py:
         candidates.append(env_py)
-    # 本机优先：D:\David\python 为 3.12（pack 需 TypeAlias）
-    candidates.append(r"D:\David\python\python.exe")
+    # 本机优先：D:\dev\python 为 3.12（pack 需 TypeAlias）
+    candidates.append(r"D:\dev\python\python.exe")
     candidates.append(sys.executable)
     candidates.extend([
         r"C:\Users\j\AppData\Roaming\uv\python\cpython-3.11.15-windows-x86_64-none\python.exe",
@@ -178,7 +180,7 @@ def _validate_artifact(path: Path, expect_no: tuple[str, ...]) -> dict:
 def main() -> int:
     ap = argparse.ArgumentParser(
         description="check + build text-only 三元 .ninfer"
-        "（默认 PTQ1_0，裁 vision/mtp/dflash2）",
+        "（默认保留 mtp/vision、裁 dflash2）",
     )
     ap.add_argument("--kind", choices=sorted(_KIND_FILES), default="PTQ1_0")
     ap.add_argument("--ninfer-root",
@@ -189,12 +191,12 @@ def main() -> int:
     ap.add_argument("--out-dir", help=f"输出目录（默认 {_DEFAULT_OUT_DIR}）")
     ap.add_argument("--check-only", action="store_true", help="只跑 pack check")
     ap.add_argument("--skip-check", action="store_true", help="跳过 check 直接 build")
-    ap.add_argument("--skip-vision", action="store_true", default=True,
-                    help="裁 vision/*（默认开）")
-    ap.add_argument("--keep-vision", action="store_true", help="保留 vision/*")
-    ap.add_argument("--skip-mtp", action="store_true", default=True,
-                    help="裁 mtp/*（默认开）")
-    ap.add_argument("--keep-mtp", action="store_true", help="保留 mtp/*")
+    ap.add_argument("--skip-vision", action="store_true",
+                    help="裁 vision/*（默认保留：引擎绑定必选）")
+    ap.add_argument("--keep-vision", action="store_true", help="保留 vision/*（默认）")
+    ap.add_argument("--skip-mtp", action="store_true",
+                    help="裁 mtp/*（默认保留：引擎绑定必选）")
+    ap.add_argument("--keep-mtp", action="store_true", help="保留 mtp/*（默认）")
     ap.add_argument("--skip-dflash2", action="store_true", default=True,
                     help="裁 dflash2/*（默认开：8G 显存紧；不用 DFlash 投机）")
     ap.add_argument("--keep-dflash2", action="store_true", help="保留 dflash2/*")
