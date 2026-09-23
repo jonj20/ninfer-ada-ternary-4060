@@ -5,26 +5,29 @@
 #
 #   just                    列出全部配方
 #   just config             打印解析出来的路径与关键开关
-#   just tool-install       一条命令装好引擎与转换器（uv tool install，装完不要仓库）
 #   just deps               构建依赖自检
-#   just check              代码门禁：ruff / mypy / pytest
-#   just build              增量构建 sm_89
-#   just build 86           增量构建 sm_86
+#   just build              增量构建 sm_89 → build_4060/apps/ninfer（零环境变量）
 #   just build-tests && just ctest
-#   just oracle             旋转内核 oracle
 #   just e2e <artifact.ninfer> [prompt]
-#   just bench <artifact.ninfer> [suite]
-#   just pack PQ2_0         打包三元制品
-#   just from-scratch PQ2_0 补丁 -> 编译 -> 测试 -> 打包，全自动
+#   just pack PTQ1_0        打包三元制品
 #   just clean              清掉构建目录与临时目录
+#
+# 中间产物（.o/ninja/可执行）默认在仓内：
+#   build_4060/  build_86/  build_test/  build_bench/
+# 要改位置只需 export NINFER_BUILD_ROOT=...，无需改本文件。
 
 set shell := ["bash", "-euo", "pipefail", "-c"]
 
-# 主干路径。这些是"本机默认值"，全部可以用环境变量覆盖。
-build_root    := env_var_or_default("NINFER_BUILD_ROOT", "/data/ninfer-build")
-build_root_86 := env_var_or_default("NINFER_BUILD_ROOT_86", "/data/ninfer-build-86")
-test_root     := env_var_or_default("NINFER_TEST_BUILD_ROOT", "/data/ninfer-build-test")
-bench_root    := env_var_or_default("NINFER_BENCH_BUILD_ROOT", "/data/ninfer-build-bench")
+# 仓根 = 本 justfile 所在目录；引擎源码已合入，NINFER_ROOT 默认即此。
+repo_root := justfile_directory()
+
+# 构建/测试/跑分中间产物与默认数据路径。
+# 默认全部落在仓内，换机器不必先 export；环境变量仍可覆盖。
+# 产物路径: <repo>/build_4060/apps/ninfer
+build_root    := env_var_or_default("NINFER_BUILD_ROOT", repo_root + "/build_4060")
+build_root_86 := env_var_or_default("NINFER_BUILD_ROOT_86", repo_root + "/build_86")
+test_root     := env_var_or_default("NINFER_TEST_BUILD_ROOT", repo_root + "/build_test")
+bench_root    := env_var_or_default("NINFER_BENCH_BUILD_ROOT", repo_root + "/build_bench")
 gguf_dir      := env_var_or_default("NINFER_TERNARY_GGUF_DIR", "/data/Ternary-Bonsai-2-27B-gguf")
 artifact_dir  := env_var_or_default("NINFER_TERNARY_ARTIFACT_DIR", "/data/Ternary-Bonsai-2-27B-ninfer")
 # 模板跟制品放一起，省掉一个 ninfer-* 中间目录。
@@ -33,7 +36,8 @@ template      := env_var_or_default("NINFER_TERNARY_TEMPLATE", artifact_dir + "/
 py            := env_var_or_default("PYTHON", ".venv/bin/python")
 
 # 下面这些要传给被调用的脚本，所以必须 export。
-export NINFER_ROOT := env_var_or_default("NINFER_ROOT", "/root/ninfer-4090")
+# 源码在树内：默认指向仓根；仍可用环境变量覆盖到外置检出（兼容旧工作流）。
+export NINFER_ROOT := env_var_or_default("NINFER_ROOT", repo_root)
 export NINFER_BUILD_ROOT := build_root
 export NINFER_CLI := env_var_or_default("NINFER_CLI", build_root + "/apps/ninfer")
 export NINFER_BENCH := env_var_or_default("NINFER_BENCH", bench_root + "/bench/ninfer_bench")
@@ -118,14 +122,12 @@ build-bench *extra:
     NINFER_BUILD_ROOT="{{bench_root}}" \
       tools/verify/build.sh incremental -- -DNINFER_BUILD_BENCHMARKS=ON {{extra}}
 
-# 从零编译引擎：拉取上游 -> 打补丁 -> 自检 -> 编译；临时树用完即删
+# 从零编译引擎（树内就地 cmake，不再 clone/打补丁）。
+# 产物在 {{build_root}}/apps；destination 仅兼容旧参数，现忽略。
 build-engine arch="89" dest="":
     #!/usr/bin/env bash
     set -euo pipefail
-    destination="{{dest}}"
-    [[ -n "$destination" ]] || destination="{{build_root}}/apps"
-    NINFER_TERNARY_ARCH="{{arch}}" uv run --no-progress python -m ninfer_ternary build-engine \
-      --destination "$destination" --source "{{NINFER_ROOT}}"
+    NINFER_ARCH="{{arch}}" just build "{{arch}}" clean
 
 # 引擎测试套件；用法 just ctest -R qwen3_6_27b
 ctest *extra:
@@ -198,46 +200,40 @@ pack-check kind:
 inspect artifact:
     "{{py}}" tools/verify/list_objects.py "{{artifact}}"
 
-# ---- 补丁 ----------------------------------------------------------------
+# ---- 补丁（已废弃：源码已合入本仓） ------------------------------------------
+# patches/ 已删除；下列配方仅保留占位，调用会明确报错。
 
-# 打印补丁清单摘要
 patch-manifest:
-    uv run --no-progress python -m ninfer_ternary manifest
+    @echo "已废弃：patches/ 已合入源码树，无需 patch-manifest" >&2
+    exit 1
 
-# 检查 ninfer 检出相对本补丁的状态
 patch-status:
-    uv run --no-progress python -m ninfer_ternary status --repo "{{NINFER_ROOT}}"
+    @echo "已废弃：源码在树内，无需 patch-status（直接 just build）" >&2
+    exit 1
 
-# 试运行应用补丁（只报告，不写文件）
 patch-dry-run:
-    uv run --no-progress python -m ninfer_ternary apply --repo "{{NINFER_ROOT}}" --dry-run
+    @echo "已废弃：源码在树内，无需 patch-dry-run" >&2
+    exit 1
 
-# 应用补丁（覆盖目标检出中的同名文件）
 patch-apply:
-    uv run --no-progress python -m ninfer_ternary apply --repo "{{NINFER_ROOT}}"
+    @echo "已废弃：源码在树内，无需 patch-apply（直接 just build）" >&2
+    exit 1
 
-# 对目标检出执行落地自检
 patch-check:
-    uv run --no-progress python -m ninfer_ternary check --repo "{{NINFER_ROOT}}"
+    @echo "已废弃：源码在树内，无需 patch-check" >&2
+    exit 1
 
-# 用检出的当前内容刷新补丁快照 / 清单摘要 / 聚合 diff；额外参数是"新纳入清单"的路径
 patch-export *add:
-    #!/usr/bin/env bash
-    set -euo pipefail
-    # 参数原样收集成 --add 列表；路径里不能带空格，本仓的路径也没有空格。
-    flags=()
-    for path in {{add}}; do flags+=("--add" "$path"); done
-    uv run --no-progress python -m ninfer_ternary export --repo "{{NINFER_ROOT}}" $flags
+    @echo "已废弃：源码在树内，无需 patch-export" >&2
+    exit 1
 
 # ---- 组合 ----------------------------------------------------------------
 
-# 干净检出一条命令走完：补丁 -> 编译 -> 测试 -> 打包三元制品
+# 干净检出一条命令走完：编译 -> 测试 -> 打包三元制品（树内一体，无补丁步骤）
 from-scratch kind:
     #!/usr/bin/env bash
     set -euo pipefail
-    just patch-apply
-    just patch-check
-    just build
+    just build 89 clean
     just build-tests
     just ctest
     just pack "{{kind}}"

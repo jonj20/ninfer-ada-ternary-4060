@@ -2,7 +2,7 @@
 # 构建 ninfer（Linux）。用法：build.sh [clean|incremental] [-- <额外的 cmake 参数>]
 #
 # 环境变量：
-#   NINFER_ROOT         ninfer 源码树根目录（必填）
+#   NINFER_ROOT         ninfer 源码树根目录；默认=本仓根（源码已合入，无需外置检出）
 #   NINFER_BUILD_ROOT   构建目录（默认 <NINFER_ROOT>/build）
 #   NINFER_ARCH         CUDA 架构，86 或 89（默认 89）
 set -euo pipefail
@@ -14,7 +14,17 @@ if [[ "${1:-}" == "--" ]]; then
   shift
 fi
 
-: "${NINFER_ROOT:?请先设置 NINFER_ROOT=<ninfer 源码树根目录>}"
+# 脚本位于 <repo>/tools/verify/build.sh → 仓根为三级父目录。
+_here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+_repo_root="$(cd "${_here}/../.." && pwd)"
+NINFER_ROOT="${NINFER_ROOT:-${_repo_root}}"
+export NINFER_ROOT
+
+if [[ ! -f "${NINFER_ROOT}/CMakeLists.txt" || ! -d "${NINFER_ROOT}/src" ]]; then
+  echo "NINFER_ROOT=${NINFER_ROOT} 不是含 CMakeLists.txt 与 src/ 的源码树" >&2
+  exit 2
+fi
+
 arch="${NINFER_ARCH:-89}"
 build_root="${NINFER_BUILD_ROOT:-${NINFER_ROOT}/build}"
 log="${build_root}/${mode}.log"
@@ -43,4 +53,5 @@ set -e
 
 echo "=== exit code: ${rc} ===" >> "${log}"
 echo "MODE=${mode} EXIT=${rc} LOG=${log}"
+echo "NINFER_ROOT=${NINFER_ROOT} BUILD_ROOT=${build_root} ARCH=${arch}"
 exit "${rc}"
