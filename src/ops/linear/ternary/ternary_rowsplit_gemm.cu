@@ -10,7 +10,9 @@
 #include "ops/linear/ternary/ternary_rowsplit_mma_small_t.cuh"
 
 #include <cstdint>
+#include <cstdlib>
 #include <stdexcept>
+#include <string>
 
 namespace ninfer::ops::detail {
 namespace {
@@ -53,6 +55,24 @@ void launch_pq2_gemv_tile(const Tensor& x, const Weight& w, Tensor& out,
             static_cast<const std::uint8_t*>(w.scales), static_cast<__nv_bfloat16*>(out.data), w.n,
             groups_per_row, tokens, out_row_stride);
     }
+    CUDA_CHECK(cudaGetLastError());
+}
+
+// Decode (T == 1) GEMV for PTQ1_0, the SIMD 4-trit path in ternary_rowsplit_gemv.cuh. Same
+// admission contract as the PQ2_0 GEMV: one token, K a whole number of 128-groups, and the padded
+// K staying at the real width so the no-guard read stays in-bounds. The reference kernel remains
+// reachable with NINFER_TERNARY_PTQ1_GEMV=0, which is the end-to-end A/B switch for this path.
+void launch_ptq1_gemv(const Tensor& x, const Weight& w, Tensor& out, cudaStream_t stream) {
+    if ((w.k % 128) != 0 || x.ne[1] != 1) {
+        throw std::invalid_argument("ternary gemv: expected one token and a whole-group K");
+    }
+    const std::int32_t groups_per_row = w.k / 128;
+    const unsigned grid               = static_cast<unsigned>(div_up(w.n, kGemvWarpsPerBlock));
+    ternary_ptq1_gemv_kernel<1><<<grid, kGemvWarpsPerBlock * 32, 0, stream>>>(
+        static_cast<const __nv_bfloat16*>(x.data), static_cast<const std::uint8_t*>(w.qdata),
+        static_cast<const std::uint8_t*>(w.qhigh), static_cast<const std::uint8_t*>(w.scales),
+        static_cast<__nv_bfloat16*>(out.data), w.n, groups_per_row, x.ne[1],
+        w.n);
     CUDA_CHECK(cudaGetLastError());
 }
 
@@ -108,10 +128,30 @@ bool gemv_admits(const Tensor& x, const Weight& w, std::int32_t max_tokens) {
            (w.k % 128) == 0 && x.ne[1] >= 1 && x.ne[1] <= max_tokens;
 }
 
+// NINFER_TERNARY_PTQ1_GEMV=0 forces the reference decode path (ternary_rowsplit_gemm_kernel),
+// the end-to-end A/B switch for the SIMD GEMV above. Read once so the choice is stable across the
+// CUDA graph capture this op runs in (same rule as ternary_mma_enabled).
+[[nodiscard]] inline bool ternary_ptq1_gemv_enabled() {
+    static const bool enabled = [] {
+        const char* value = std::getenv("NINFER_TERNARY_PTQ1_GEMV");
+        return value == nullptr || std::string(value) != "0";
+    }();
+    return enabled;
+}
+
+bool ptq1_gemv_admits(const Tensor& x, const Weight& w, std::int32_t max_tokens) {
+    return w.qtype == QType::PTQ1_0_G128 && w.qhigh != nullptr && w.padded_shape[1] == w.k &&
+           (w.k % 128) == 0 && x.ne[1] >= 1 && x.ne[1] <= max_tokens;
+}
+
 void launch_ternary_gemm_t1(const Tensor& x, const Weight& w, Tensor& out,
                             std::int32_t out_row_stride, cudaStream_t stream) {
     if (gemv_admits(x, w, 1)) {
         launch_pq2_gemv_tile(x, w, out, out_row_stride, x.ne[1], stream);
+        return;
+    }
+    if (ternary_ptq1_gemv_enabled() && ptq1_gemv_admits(x, w, 1)) {
+        launch_ptq1_gemv(x, w, out, stream);
         return;
     }
     launch_by_qtype<1>(x, w, out, out_row_stride, stream);

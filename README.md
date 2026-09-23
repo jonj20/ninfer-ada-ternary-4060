@@ -55,12 +55,20 @@ MTP 投机本期不支持（8G 卡预留 924 MiB 不足）。
 
 ### 性能基线（4060，PTQ1_0，仅记录不调优）
 
+> 2026-09-24 起 decode 走 **PTQ1_0 SIMD 4-trit 解码 warp-per-row GEMV 快路径**（`NINFER_TERNARY_PTQ1_GEMV=1`），
+> 对比全程参考解码可回退：`NINFER_TERNARY_PTQ1_GEMV=0`。token 序列与参考逐 token 一致。
+
 | 项 | 实测 |
 |---|---|
-| decode | **3.36 tok/s**（greedy / rk4v4-e8 / ctx2048 稳态） |
+| **decode（新快路径）** | **8.33 tok/s**（greedy / rk4v4-e8 / ctx2048 稳态，192 tok） |
+| decode（参考解码回退） | **3.36 tok/s**（greedy / rk4v4-e8 / ctx2048 稳态） |
 | prefill | **9.09 tok/s**（同上，28 tok prompt） |
 | 参照：4090 PTQ1_0 | 15.8 tok/s decode |
-| 参照：llama.cpp 同机同文件 | **25 t/s**，差距 ≈ ×7.4 |
+| 参照：llama.cpp 同机同文件 | **25 t/s**，差距 ≈ ×3.0（立案前 ×7.4） |
+
+decode 快路径收益 ≈ **×2.48**（3.36 → 8.33），源自 SIMD 4-trit 解码 + warp-per-row 结构改写，
+实现与验证见开发文档 §9.3。剩余 ×3.0 差距（llama.cpp 25 t/s 对照）仍是二期首要优化项，
+跟踪见开发文档 §9.1。
 
 差距已立案为二期首要优化项（PTQ1_0 base-3 慢路径、缺 GEMV/MMA 快指令），
 跟踪见开发文档 §9.1。两种格式的对比结论见开发文档 §8。
