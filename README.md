@@ -1,10 +1,11 @@
-# ninfer-ternary
+# ninfer-ada-ternary-4060
 
 把 [NInfer](https://github.com/UDPSendToFailed/ninfer-4090)（Apache-2.0）的**三元**能力
-（Ternary Bonsai 2 27B）落到 **RTX 3090（sm_86）与 RTX 4090（sm_89）** 上。
+（Ternary Bonsai 2 27B）落到 **RTX 4060 8G（sm_89）** 上——当前主要修改目标；
+sm_86 / sm_89（3090 / 4090）为兼容与对照平台。
 
-引擎源码不在本仓：安装时按钉死的提交从上游拉取，打上本仓的三元补丁，编译后打进 wheel，
-临时文件用完即删。装完你得到三个可执行文件：
+引擎源码已在树内（合入上游 v1.2.0 + 三元补丁），`uv tool install` 时树内 cmake 编译后打进 wheel。
+装完你得到三个可执行文件：
 
 | 命令 | 用途 |
 |---|---|
@@ -13,6 +14,56 @@
 | `ninfer-convert` | 把 Ternary Bonsai 的 GGUF 转成 ninfer 制品（`.ninfer`）|
 
 本仓不发布任何模型权重，也不发布由权重派生的 `.ninfer` 制品。
+
+---
+
+## RTX 4060 主线（当前目标）
+
+本仓当前的主要修改目标是 **RTX 4060 8G（sm_89）**，主力格式 **PTQ1_0**。
+与 4090 同为 Ada sm_89，代码层完全兼容，差异只在显存容量与算力档位。
+完整决策、阶段状态与实测记录见 [docs/4060-开发跟踪.md](docs/4060-开发跟踪.md)。
+
+### 一键构建与打包
+
+    ./build_4060.sh            # Linux / WSL：增量构建 → build_4060/apps/ninfer
+    build_4060.bat             # Windows 等价入口
+    pack_ptq1_4060.bat         # 打包 PTQ1_0 制品（保留 mtp/vision，裁 dflash2）
+
+低内存（7.6 GiB）构建机默认 `NINFER_JOBS=1`，防单文件 CUDA 编译 OOM。
+
+### 生成的制品（2026-09-23 实测）
+
+| 制品 | 大小 | 说明 |
+|---|---|---|
+| `Ternary-Bonsai-2-27B-PTQ1_0-text.ninfer` | 7,047,407,628 B（6.563 GiB） | 1126 对象 = frontend 6 + text 775 + mtp 12 + vision 333，无 dflash2 |
+| `build_4060/apps/ninfer` | 235 MB | sm_89 可执行（`ninfer-serve` 246 MB） |
+
+制品绑定结论：引擎把 mtp/vision 当**必选存在项**，唯一可裁的是 dflash2；
+早期裁掉 mtp/vision 的 text-only 制品启动即报缺对象，已弃。
+
+### 正确性冒烟（4060 8G，全过）
+
+| 用例 | 结果 |
+|---|---|
+| 贪心 `17 * 23` | **391** |
+| `MMA=1` vs `MMA=0` | 逐字节一致（hash `b327e287e849`） |
+| `HADAMARD=0` 负控 | 乱码，与正控分离 |
+| 装载显存 | 权重 5.52 GiB，8G 卡内可起跑 |
+
+建议起跑参数：`--kv-dtype rk4v4-e8 --max-context 3584 --prefill-chunk 1024`。
+MTP 投机本期不支持（8G 卡预留 924 MiB 不足）。
+
+### 性能基线（4060，PTQ1_0，仅记录不调优）
+
+| 项 | 实测 |
+|---|---|
+| decode | **3.36 tok/s**（greedy / rk4v4-e8 / ctx2048 稳态） |
+| prefill | **9.09 tok/s**（同上，28 tok prompt） |
+| 参照：4090 PTQ1_0 | 15.8 tok/s decode |
+| 参照：llama.cpp 同机同文件 | **25 t/s**，差距 ≈ ×7.4 |
+
+差距已立案为二期首要优化项（PTQ1_0 base-3 慢路径、缺 GEMV/MMA 快指令），
+跟踪见开发文档 §9.1。两种格式的对比结论见开发文档 §8。
 
 ---
 
@@ -174,7 +225,8 @@ nvfp4）会在后面以张量名对不上的形式失败。
 | [移植报告](docs/移植报告-ninfer-4090.md) | 判定依据、实测证据、未验证部分 |
 | [权重档案与容量规划](docs/权重档案与容量规划.md) | 制品档案改变了什么、容量查询逐条对照 |
 | [依赖安装](docs/依赖安装-RockyLinux10.md) | Rocky Linux 10 缺失库清单与安装命令 |
-| [改动说明](patches/README-改动说明.md) | 45 个文件的改动清单、与上游的刻意差异 |
+| [改动说明](README-改动说明.md) | 45 个文件的改动清单、与上游的刻意差异 |
+| [4060 开发跟踪](docs/4060-开发跟踪.md) | 4060 主线：阶段状态、冒烟/性能实测、4060↔4090 兼容性与 PQ2_0↔PTQ1_0 对比 |
 
 ---
 
