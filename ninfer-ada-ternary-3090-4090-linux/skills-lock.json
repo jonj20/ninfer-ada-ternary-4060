@@ -1,0 +1,35 @@
+{
+  "version": 1,
+  "skills": {
+    "chinese-coding-guidelines": {
+      "source": "xumaxie/chinese-ai-coding-skills",
+      "sourceType": "github",
+      "skillPath": "skills/chinese-coding-guidelines/SKILL.md",
+      "computedHash": "f0776a20f02ee9264cdc5439db206f68706a6fbcf5118b6dd102dc6354dc3c22"
+    },
+    "code-documenter": {
+      "source": "jeffallan/claude-skills",
+      "sourceType": "github",
+      "skillPath": "skills/code-documenter/SKILL.md",
+      "computedHash": "49709db09641a9ab4196459835bfcbe565eb0581c23cb4eeb50ff80d2af88272"
+    },
+    "code-polish": {
+      "source": "PaulRBerg/agent-skills",
+      "sourceType": "github",
+      "skillPath": "skills/code-polish/SKILL.md",
+      "computedHash": "69e11497064bc87d6af0eaca3a6291540c23137e03fa886399c61e19faeff8ed"
+    },
+    "docstring-generator-skill": {
+      "source": "darellchua2/civiltekk-opencode-claude-skills",
+      "sourceType": "github",
+      "skillPath": "skills/docstring-generator-skill/SKILL.md",
+      "computedHash": "2848b8e2fb263ed63e9c4b3f25ef04ac6dee906f9a2c480fdef2e6899e8e8e23"
+    },
+    "logging-best-practices": {
+      "source": "boristane/agent-skills",
+      "sourceType": "github",
+      "skillPath": "skills/logging-best-practices/SKILL.md",
+      "computedHash": "b4810947c33b5356bf385c84cfe387afa9c54af652baaedb7d642a083cceaa4c"
+    }
+  }
+}

@@ -1,0 +1,15 @@
+ninfer-ternary
+Copyright 2025 ninfer-ternary contributors
+
+This product is a derivative work of NInfer.
+
+It includes software developed as part of NInfer:
+  https://github.com/UDPSendToFailed/ninfer-4090        (Apache-2.0, v1.2.0 line)
+  https://www.modelscope.cn/shensanshu/ninfer-ada-ternary.git  (Apache-2.0, ternary port)
+
+The engine source is not vendored here: it is fetched from the upstream repository at a
+pinned commit, patched at build time, and compiled into the installed tool. The patch set
+and the changes it carries are described in patches/README-改动说明.md.
+
+Model weights and the .ninfer artifacts derived from them are NOT distributed with this
+project; their rights remain with their respective authors (PrismML / Qwen).

@@ -1,0 +1,313 @@
+function(ninfer_internal_includes target)
+  target_include_directories(${target} PRIVATE
+    ${PROJECT_SOURCE_DIR}/include
+    ${PROJECT_SOURCE_DIR}/src
+    ${PROJECT_SOURCE_DIR}/third_party
+    ${PROJECT_SOURCE_DIR}/third_party/utf8proc)
+endfunction()
+
+# Every device symbol in this project is defined and consumed inside a single translation
+# unit: there is no `extern __device__`/`extern __constant__`, no cross-TU `__global__`
+# declaration, no device function pointer, and no dynamic parallelism (`pdl.cuh` compiles to
+# an ordinary host launch on sm_86/sm_89). Relocatable device code is therefore pure cost --
+# it forces ptxas to assume external linkage, which turns dynamic-lane `__shfl_sync` into an
+# out-of-line ABI call (stack frame + spills) and disables software pipelining of global
+# loads across loop back edges. Compiling whole-program keeps ptxas free to optimize.
+function(ninfer_cuda_archive target)
+  if(WIN32)
+    set_target_properties(${target} PROPERTIES CUDA_RUNTIME_LIBRARY Static)
+  endif()
+  target_compile_options(${target} PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:-lineinfo>)
+endfunction()
+
+# Device/tensor/layout/graph primitives and the model-independent request runtime.
+add_library(ninfer_core STATIC
+  core/arena.cu
+  core/device.cu
+  core/dtype.cpp
+  core/disk_state_cache.cpp
+  core/direct_storage_engine.cpp
+  core/gdn_replay_records.cpp
+  core/cyclic_kv_cache.cpp
+  core/paged_kv_cache.cu
+  core/linear_attention_state.cpp
+  core/layout.cpp
+  core/tensor.cpp
+  core/decode_graph.cpp
+  runtime/engine/admission_policy.cpp
+  runtime/engine/kv_capacity.cpp
+  runtime/engine/public_types.cpp
+  runtime/engine/request_memory.cpp)
+ninfer_internal_includes(ninfer_core)
+ninfer_cuda_archive(ninfer_core)
+target_link_libraries(ninfer_core PUBLIC ${NINFER_CUDART_TARGET} CUDA::nvtx3)
+if(WIN32)
+  target_link_libraries(ninfer_core PUBLIC ninfer_directstorage d3d12 dxgi)
+endif()
+
+# Generic .ninfer framing, binding, and direct final materialization.
+add_library(ninfer_artifact STATIC
+  artifact/reader.cpp
+  artifact/storage_layouts.cpp
+  artifact/binder.cpp
+  artifact/materializer.cpp
+  artifact/typed_binding.cpp)
+ninfer_internal_includes(ninfer_artifact)
+target_link_libraries(ninfer_artifact PUBLIC ninfer_core)
+
+# Shared mathematical Ops. The list is intentionally explicit: adding a
+# source is a build-boundary decision, not an accidental recursive-glob side effect.
+add_library(ninfer_ops STATIC
+  ops/launcher/add_bias.cu
+  ops/launcher/argmax.cu
+  ops/launcher/cast.cu
+  ops/launcher/causal_conv1d.cu
+  ops/launcher/embed_gather.cu
+  ops/launcher/gdn_gating.cu
+  ops/launcher/gelu.cu
+  ops/launcher/bidirectional_gqa_attention.cu
+  ops/launcher/swa.cu
+  ops/launcher/gqa_attention_decode.cu
+  ops/launcher/gqa_attention_prefill.cu
+  ops/launcher/kv_cache_append_prefix.cu
+  ops/launcher/l2norm.cu
+  ops/launcher/layer_norm.cu
+  ops/launcher/mtp_pack.cu
+  ops/launcher/mtp_round.cu
+  ops/launcher/speculative_round.cu
+  ops/launcher/position.cu
+  ops/launcher/prepare_ragged_prefix.cu
+  ops/launcher/prepare_masked_block.cu
+  ops/launcher/residual_add.cu
+  ops/launcher/rmsnorm.cu
+  ops/launcher/rope.cu
+  ops/launcher/sampling.cu
+  ops/launcher/scalar.cu
+  ops/launcher/scatter.cu
+  ops/launcher/sigmoid_gate_mul.cu
+  ops/launcher/silu_and_mul.cu
+  ops/launcher/vision_attention.cu
+  ops/launcher/vision_pos_embed.cu
+  # Gated DeltaNet Linear Attention core.
+  ops/linear_attention/gated_delta_net/gated_delta_net.cpp
+  ops/linear_attention/gated_delta_net/replay.cpp
+  ops/linear_attention/gated_delta_net/recurrent.cu
+  ops/linear_attention/gated_delta_net/chunked/launch.cu
+  ops/linear_attention/gated_delta_net/chunked/prepare_wy_wu.cu
+  ops/linear_attention/gated_delta_net/chunked/state_passing.cu
+  ops/linear_attention/gated_delta_net/chunked/output.cu
+  ops/attn_input_proj/bf16/bf16_attn_input_decode.cu
+  ops/attn_input_proj/bf16/bf16_attn_input_gemm_mma.cu
+  ops/attn_input_proj/bf16/bf16_attn_input_small_t.cu
+  ops/attn_input_proj/bf16/bf16_attn_input_plan.cpp
+  ops/attn_input_proj/q4_q5/q4_q5_attn_input_gemm_mma.cu
+  ops/attn_input_proj/q4_q5/q4_q5_attn_input_small_t.cu
+  ops/attn_input_proj/q4_q5/q4_q5_attn_input_plan.cpp
+  ops/attn_input_proj/w8/w8_attn_input_decode.cu
+  ops/attn_input_proj/w8/w8_attn_input_gemm_mma.cu
+  ops/attn_input_proj/w8/w8_attn_input_gemm_simt.cu
+  ops/attn_input_proj/w8/w8_attn_input_gemm_splitk.cu
+  ops/attn_input_proj/w8/w8_attn_input_plan.cpp
+  ops/gdn_input_proj/q4_q5/q4_q5_gdn_input_gemm_mma.cu
+  ops/gdn_input_proj/q4_q5/q4_q5_gdn_input_independent.cu
+  ops/gdn_input_proj/q4_q5/q4_q5_gdn_input_conv_snapshot.cu
+  ops/gdn_input_proj/q4_q5/q4_q5_gdn_input_plan.cpp
+  ops/gdn_input_proj/gdn_projected_conv.cu
+  ops/gdn_input_proj/w8/w8_gdn_input_decode.cu
+  ops/gdn_input_proj/w8/w8_gdn_input_gemm_mma.cu
+  ops/gdn_input_proj/w8/w8_gdn_input_gemm_splitk.cu
+  ops/gdn_input_proj/w8/w8_gdn_input_plan.cpp
+  ops/gdn_gating_proj/bf16/bf16_gdn_gating_proj_kernels.cu
+  ops/gdn_gating_proj/bf16/bf16_gdn_gating_proj_plan.cpp
+  ops/linear/bf16/bf16_gemv.cu
+  ops/linear/bf16/bf16_gemm_mma.cu
+  ops/linear/bf16/bf16_small_t.cu
+  ops/linear/bf16/bf16_dispatch.cpp
+  ops/linear/q4/q4_small_t_mma.cu
+  ops/linear/q4/q4_rowsplit_gemm_mma.cu
+  ops/linear/q4/q4_rowsplit_gemm_simt.cu
+  ops/linear/q4/q4_rowsplit_gemv.cu
+  ops/linear/q4/q4_dispatch.cpp
+  ops/linear/q5/q5_dispatch.cpp
+  ops/linear/q5/q5_small_t_mma.cu
+  ops/linear/q5/q5_rowsplit_gemm_mma.cu
+  ops/linear/q5/q5_rowsplit_gemm_simt.cu
+  ops/linear/q5/q5_rowsplit_gemv.cu
+  ops/linear_add/bf16/bf16_linear_add_decode.cu
+  ops/linear_add/bf16/bf16_linear_add_gemm_mma.cu
+  ops/linear_add/bf16/bf16_linear_add_small_t.cu
+  ops/linear_add/bf16/bf16_linear_add_plan.cpp
+  ops/linear_add/q5/q5_linear_add_gemm_mma.cu
+  ops/linear_add/q5/q5_linear_add_gemm_simt.cu
+  ops/linear_add/q5/q5_linear_add_gemv.cu
+  ops/linear_add/q5/q5_linear_add_plan.cpp
+  ops/linear_add/w8/w8_linear_add_gemm_mma.cu
+  ops/linear_add/w8/w8_linear_add_gemm_simt.cu
+  ops/linear_add/w8/w8_linear_add_gemm_splitk.cu
+  ops/linear_add/w8/w8_linear_add_plan.cpp
+  ops/linear_swiglu/q4/q4_linear_swiglu_gemm_mma.cu
+  ops/linear_swiglu/q4/q4_linear_swiglu_gemv.cu
+  ops/linear_swiglu/q4/q4_linear_swiglu_plan.cpp
+  ops/linear_swiglu/w8/w8_linear_swiglu_decode.cu
+  ops/linear_swiglu/w8/w8_linear_swiglu_gemm_mma.cu
+  ops/linear_swiglu/w8/w8_linear_swiglu_gemm_splitk.cu
+  ops/linear_swiglu/w8/w8_linear_swiglu_plan.cpp
+  ops/linear/q6/q6_dispatch.cpp
+  ops/linear/q6/q6_rowsplit_gemm_mma.cu
+  ops/linear/q6/q6_rowsplit_gemm_simt.cu
+  # 三元（Prism / Bonsai 2 27B）折叠基线性层：解码 GEMV + 小 T 张量核路径 + 旋转编排。
+  ops/linear/ternary/ternary_rowsplit_gemm.cu
+  ops/linear/ternary/ternary_dispatch.cpp
+  ops/linear/ternary/ternary_rotation.cu
+  ops/linear/ternary/ternary_rotation.cpp
+  ops/linear/w8/w8_rowsplit_gemm_mma.cu
+  ops/linear/w8/w8_rowsplit_gemm_simt.cu
+  ops/linear/w8/w8_rowsplit_gemm_decode.cu
+  ops/linear/w8/w8_small_t.cu
+  ops/linear/w8/w8_rowsplit_gemm_splitk.cu
+  ops/linear/w8/w8_dispatch.cpp
+  ops/linear_pair/w8/w8_pair_decode.cu
+  ops/linear_pair/w8/w8_pair_gemm_concat.cu
+  ops/linear_pair/w8/w8_pair_gemm_mma.cu
+  ops/linear_pair/w8/w8_pair_gemm_splitk.cu
+  ops/linear_pair/w8/w8_pair_plan.cpp
+  ops/sparse_moe/decode/sparse_moe_decode_kernels.cu
+  ops/sparse_moe/decode/sparse_moe_decode_plan.cpp
+  ops/sparse_moe/prefill/sparse_moe_prefill_kernels.cu
+  ops/sparse_moe/prefill/sparse_moe_prefill_plan.cpp
+  ops/sparse_moe/small_t/sparse_moe_small_t_kernels.cu
+  ops/sparse_moe/small_t/sparse_moe_small_t_plan.cpp
+  ops/linear/linear.cpp
+  ops/wrapper/add_bias.cpp
+  ops/wrapper/argmax.cpp
+  ops/wrapper/cast.cpp
+  ops/wrapper/causal_conv1d_silu.cpp
+  ops/wrapper/embedding.cpp
+  ops/wrapper/gdn_gating.cpp
+  ops/wrapper/gdn_gating_proj.cpp
+  ops/wrapper/gdn_input_proj.cpp
+  ops/wrapper/gelu.cpp
+  ops/wrapper/bidirectional_gqa_attention.cpp
+  ops/wrapper/swa.cpp
+  ops/wrapper/gqa_attention.cpp
+  ops/wrapper/kv_cache_append_prefix.cpp
+  ops/wrapper/attn_input_proj.cpp
+  ops/wrapper/l2norm.cpp
+  ops/wrapper/layer_norm.cpp
+  ops/wrapper/linear_add.cpp
+  ops/wrapper/linear_pair.cpp
+  ops/wrapper/linear_swiglu.cpp
+  ops/wrapper/mtp_pack.cpp
+  ops/wrapper/mtp_round.cpp
+  ops/wrapper/speculative_round.cpp
+  ops/wrapper/position.cpp
+  ops/wrapper/prepare_ragged_prefix.cpp
+  ops/wrapper/prepare_masked_block.cpp
+  ops/wrapper/residual_add.cpp
+  ops/wrapper/rmsnorm.cpp
+  ops/wrapper/rope.cpp
+  ops/wrapper/sampling.cpp
+  ops/wrapper/scalar.cpp
+  ops/wrapper/scatter.cpp
+  ops/wrapper/sigmoid_mul.cpp
+  ops/wrapper/silu_mul.cpp
+  ops/wrapper/sparse_moe.cpp
+  ops/wrapper/vision_attention.cpp
+  ops/wrapper/vision_pos_embed.cpp)
+if(CMAKE_CUDA_ARCHITECTURES MATCHES "^(86|89)$")
+  if(CMAKE_CUDA_ARCHITECTURES STREQUAL "86")
+    target_compile_definitions(ninfer_ops PUBLIC NINFER_SM86=1)
+  elseif(CMAKE_CUDA_ARCHITECTURES STREQUAL "89")
+    target_compile_definitions(ninfer_ops PUBLIC NINFER_SM89=1)
+  endif()
+endif()
+ninfer_internal_includes(ninfer_ops)
+ninfer_cuda_archive(ninfer_ops)
+target_link_libraries(ninfer_ops PUBLIC ninfer_core)
+
+# Product-independent text and media mechanisms.
+add_library(ninfer_text STATIC
+  text/unicode.cpp
+  ${PROJECT_SOURCE_DIR}/third_party/utf8proc/utf8proc.c)
+ninfer_internal_includes(ninfer_text)
+target_compile_definitions(ninfer_text PUBLIC UTF8PROC_STATIC)
+
+add_library(ninfer_media_decode STATIC
+  media/decode/decode.cpp)
+ninfer_internal_includes(ninfer_media_decode)
+target_link_libraries(ninfer_media_decode PRIVATE ${NINFER_FFMPEG_TARGET})
+
+if(NINFER_BUILD_MEDIA_ACQUIRE)
+  # Product-only path/data/HTTP acquisition. No target package links this library.
+  add_library(ninfer_media_acquire STATIC
+    product/media_acquire/acquire.cpp)
+  ninfer_internal_includes(ninfer_media_acquire)
+  target_link_libraries(ninfer_media_acquire PRIVATE ${NINFER_CURL_TARGET})
+  if(WIN32)
+    target_link_libraries(ninfer_media_acquire PRIVATE ws2_32)
+  endif()
+endif()
+
+if(NINFER_BUILD_PROMPT_INPUT)
+  # Owning command-line message input shared by product entry points and target diagnostics.
+  add_library(ninfer_product_prompt_input STATIC
+    product/prompt_input/prompt_input.cpp)
+  ninfer_internal_includes(ninfer_product_prompt_input)
+  target_link_libraries(ninfer_product_prompt_input PRIVATE ninfer_media_acquire)
+endif()
+
+if(NINFER_BUILD_APPS OR BUILD_TESTING)
+  add_library(ninfer_product_load_progress STATIC
+    product/load_progress/load_progress.cpp)
+  ninfer_internal_includes(ninfer_product_load_progress)
+endif()
+
+# One cold closed registry plus the opaque public product Engine. Family and exact-target
+# directories contribute their sources directly to this single compile owner below.
+add_library(ninfer_engine STATIC
+  targets/registry.cpp
+  runtime/contract/sampling.cpp
+  runtime/engine/engine.cpp)
+ninfer_internal_includes(ninfer_engine)
+target_include_directories(ninfer_engine PUBLIC ${PROJECT_SOURCE_DIR}/include)
+
+add_subdirectory(targets/qwen3_6)
+add_subdirectory(targets/qwen3_6_27b)
+add_subdirectory(targets/qwen3_6_35b_a3b)
+
+target_link_libraries(ninfer_engine
+  PRIVATE
+    ninfer_artifact
+    ninfer_core
+    ninfer_ops
+    ninfer_text
+    ninfer_media_decode
+    ninfer_xgrammar)
+add_library(ninfer::engine ALIAS ninfer_engine)
+
+if(NINFER_BUILD_SERVE)
+  # HTTP protocol/product adapter. No serving header is part of the public API.
+  add_library(ninfer_serve STATIC
+    serve/openai_schema.cpp
+    serve/responses_schema.cpp
+    serve/anthropic_schema.cpp
+    serve/response_store.cpp
+    serve/tool_call_parser.cpp
+    serve/translate.cpp
+    serve/console_log.cpp
+    serve/generation_service.cpp
+    serve/request_log.cpp
+    serve/http_server.cpp
+    serve/responses_http.cpp
+    serve/serve_metrics.cpp
+    serve/serve_options.cpp
+    ${NINFER_UI_CPP})
+  ninfer_internal_includes(ninfer_serve)
+  target_include_directories(ninfer_serve
+    PUBLIC ${NINFER_UI_GEN_DIR}
+    PRIVATE ${PROJECT_SOURCE_DIR}/third_party/cpp-httplib)
+  add_dependencies(ninfer_serve ninfer_ui_assets)
+  target_link_libraries(ninfer_serve
+    PUBLIC ninfer_engine Threads::Threads
+    PRIVATE ninfer_media_acquire ${NINFER_CUDART_TARGET})
+endif()

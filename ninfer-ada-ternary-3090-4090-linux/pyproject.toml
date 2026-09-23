@@ -1,0 +1,77 @@
+[project]
+name = "ninfer-ternary"
+version = "0.3.0"
+description = "ninfer-4090 的三元移植：一条 uv tool install 拿到编译好的引擎与 GGUF 转换器"
+readme = "README.md"
+requires-python = ">=3.12"
+license = "Apache-2.0"
+license-files = ["LICENSE", "NOTICE"]
+dependencies = ["numpy>=1.26"]
+
+[project.optional-dependencies]
+# 打包器要走上游 tools/artifact 的张量读写，那个模块在导入期就用 torch。
+# 因此引擎侧安装不装它，只有要转换模型时才装：uv tool install "ninfer-ternary[convert]"。
+convert = ["torch>=2.4"]
+
+[project.scripts]
+ninfer = "ninfer_ternary.launch:main_ninfer"
+ninfer-serve = "ninfer_ternary.launch:main_serve"
+ninfer-convert = "ninfer_ternary.convert:main"
+
+[build-system]
+requires = []
+build-backend = "build_backend"
+backend-path = ["."]
+
+[dependency-groups]
+dev = [
+  "mypy>=2.3.1",
+  "pytest>=8.0",
+  "ruff>=0.6",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]
+addopts = "-q"
+
+[tool.mypy]
+python_version = "3.12"
+mypy_path = ["src", "."]
+# tools/ 是从 ninfer-ada-ternary 平移的脚本，patches/changed-files/ 是补丁原样副本：
+# 两者都不是本仓编写的代码，与 ruff 的 extend-exclude 保持同一口径，不纳入类型门禁。
+exclude = ["(^|/)(tools|patches)/"]
+
+[[tool.mypy.overrides]]
+module = ["tools.*", "patches.*", "pack"]
+follow_imports = "skip"
+ignore_missing_imports = true
+
+[tool.ruff]
+target-version = "py312"
+line-length = 100
+# tools/ 是从 ninfer-ada-ternary 平移过来的脚本，保持原貌以便与上游逐行对照。
+extend-exclude = ["tools"]
+
+[tool.ruff.lint]
+select = [
+  "E",   # pycodestyle errors
+  "F",   # pyflakes
+  "I",   # isort
+  "D",   # pydocstyle
+  "T20", # flake8-print — 禁止 print
+]
+extend-select = ["G", "LOG"]
+# 中文句号不被 pydocstyle 认作句末标点，而本仓要求中文优先的 docstring。
+ignore = ["D400", "D415"]
+
+[tool.ruff.lint.pydocstyle]
+convention = "google"
+
+[tool.ruff.lint.per-file-ignores]
+"tests/**" = ["D"]
+"src/ninfer_ternary/cli.py" = ["T20"]
+"src/ninfer_ternary/launch.py" = ["T20"]
+
+[tool.ruff.format]
+docstring-code-format = true

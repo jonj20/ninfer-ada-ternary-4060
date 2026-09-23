@@ -1,0 +1,17 @@
+# Python-generated files
+__pycache__/
+*.py[oc]
+build/
+dist/
+wheels/
+*.egg-info
+
+# Virtual environments
+.venv
+
+# 工具缓存与验证产物
+.pytest_cache/
+.ruff_cache/
+
+# 验证与跑分的结果目录（证据，不是中间产物；just clean 不会删它）
+out/

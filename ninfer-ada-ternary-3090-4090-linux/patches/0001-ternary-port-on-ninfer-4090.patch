@@ -1,0 +1,3606 @@
+--- a/include/ninfer/ops/attn_input_proj.h
++++ b/include/ninfer/ops/attn_input_proj.h
+@@ -34,6 +34,20 @@
+                      cudaStream_t stream);
+ 
+ /**
++ * 带显式工作区的双父权重注意力输入投影，语义与上面的重载相同。
++ *
++ * 折叠（旋转基）三元父权重 PTQ1_0_G128 / PQ2_0_G128 RowSplit `[7168,5120]` 只在这里被接纳：
++ * 它们的激活必须先映射进旋转基再做矩阵乘，而这块 scratch 只能来自工作区。四个投影共用同一次
++ * 旋转，所以每次调用只付一次，而不是每个父权重一次。
++ *
++ * Workspace:
++ *   父权重为折叠格式时为 `[5120, T]` 的 BF16 旋转缓冲；否则为零字节。
++ */
++void attn_input_proj(const Tensor& x, const Weight& query_key_weight,
++                     const Weight& gate_value_weight, Tensor& q, Tensor& gate, Tensor& k, Tensor& v,
++                     WorkspaceArena& workspace, cudaStream_t stream);
++
++/**
+  * Computes the single-parent Q/K/output-gate/V projection.
+  *
+  * The parent stores rows in physical order query, key, output gate, value while the public output
+--- a/include/ninfer/ops/gdn_input_proj.h
++++ b/include/ninfer/ops/gdn_input_proj.h
+@@ -43,6 +43,19 @@
+                     Tensor& qkv, Tensor& z, cudaStream_t stream);
+ 
+ /**
++ * 带显式工作区的双父权重 GDN 投影，语义与上面的重载相同。
++ *
++ * 折叠（旋转基）三元父权重 PTQ1_0_G128 / PQ2_0_G128 `[4096,5120]` 与 `[12288,5120]` 只在这里
++ * 被接纳：它们的激活必须先映射进旋转基再做矩阵乘，而这块 scratch 只能来自工作区。三个投影共用
++ * 同一次旋转，所以每次调用只付一次，而不是每个父权重一次。
++ *
++ * Workspace:
++ *   父权重为折叠格式时为 `[5120, T]` 的 BF16 旋转缓冲；否则为零字节。
++ */
++void gdn_input_proj(const Tensor& x, const Weight& qk_weight, const Weight& value_z_weight,
++                    Tensor& qkv, Tensor& z, WorkspaceArena& workspace, cudaStream_t stream);
++
++/**
+  * Single-parent GDN projection. Registered parent forms are:
+  *
+  * - W8G32_F16S RowSplit [12288,2048], with stored row counts [2048,2048,4096,4096].
+@@ -84,6 +97,18 @@
+     std::int32_t batch_size, std::int32_t min_width, std::int32_t max_width);
+ 
+ /**
++ * Returns the transient capacity for the folded (rotated-basis) ternary two-parent snapshot form.
++ *
++ * The folded parents share Q4/Q5's row geometry, so the query above cannot describe them: they never
++ * take the fused projection+epilogue schedule and therefore always need both a [C,B*W] projected
++ * plane and a [5120,B*W] activation-rotation buffer. Splitting the query by profile keeps the fused
++ * query exact instead of padding it for a route its caller never takes.
++ */
++[[nodiscard]] std::size_t gdn_input_proj_conv_snapshot_folded_workspace_capacity_bytes(
++    std::int32_t query_rows, std::int32_t key_rows, std::int32_t value_rows,
++    std::int32_t batch_size, std::int32_t min_width, std::int32_t max_width);
++
++/**
+  * Op: gdn_input_proj_conv_snapshot
+  *
+  * Math / indexing:
+@@ -156,6 +181,17 @@
+     std::int32_t query_rows, std::int32_t key_rows, std::int32_t value_rows,
+     std::int32_t batch_size, std::int32_t min_width, std::int32_t max_width);
+ 
++/**
++ * Returns the transient capacity for the folded (rotated-basis) ternary two-parent record form.
++ *
++ * The projection still writes straight into the caller-owned conv_record, but the folded GEMM must
++ * first map the flattened [5120,B*T] activation into the rotated basis, and that scratch is not
++ * caller-owned.
++ */
++[[nodiscard]] std::size_t gdn_input_proj_conv_record_folded_workspace_capacity_bytes(
++    std::int32_t query_rows, std::int32_t key_rows, std::int32_t value_rows,
++    std::int32_t batch_size, std::int32_t min_width, std::int32_t max_width);
++
+ /**
+  * Op: gdn_input_proj_conv_record
+  *
+--- a/src/CMakeLists.txt
++++ b/src/CMakeLists.txt
+@@ -155,6 +155,11 @@
+   ops/linear/q6/q6_dispatch.cpp
+   ops/linear/q6/q6_rowsplit_gemm_mma.cu
+   ops/linear/q6/q6_rowsplit_gemm_simt.cu
++  # 三元（Prism / Bonsai 2 27B）折叠基线性层：解码 GEMV + 小 T 张量核路径 + 旋转编排。
++  ops/linear/ternary/ternary_rowsplit_gemm.cu
++  ops/linear/ternary/ternary_dispatch.cpp
++  ops/linear/ternary/ternary_rotation.cu
++  ops/linear/ternary/ternary_rotation.cpp
+   ops/linear/w8/w8_rowsplit_gemm_mma.cu
+   ops/linear/w8/w8_rowsplit_gemm_simt.cu
+   ops/linear/w8/w8_rowsplit_gemm_decode.cu
+--- a/src/artifact/binder.cpp
++++ b/src/artifact/binder.cpp
+@@ -30,6 +30,10 @@
+     return reader_.find(name) != nullptr;
+ }
+ 
++const ObjectDescriptor* Binder::find(std::string_view name) const noexcept {
++    return reader_.find(name);
++}
++
+ ObjectHandle Binder::find_unconsumed(std::string_view name) {
+     const auto& objects            = reader_.objects();
+     const ObjectDescriptor* object = reader_.find(name);
+--- a/src/artifact/binder.h
++++ b/src/artifact/binder.h
+@@ -48,6 +48,11 @@
+                                 std::span<const std::uint64_t> shape);
+     ObjectHandle require_resource(std::string_view name, ResourceEncoding encoding);
+ 
++    // 只窥视对象描述符，不消耗它。bind_tensor()/require_tensor() 会消耗对象并要求格式与预期
++    // 完全一致，所以要"先知道制品真正声明了什么格式、再绑定"就只能走这里 —— 分组 row-split
++    // 权重正需要如此：同族成员在容器层面可互换，制品存的可能不是调用方计划里点名的那一个。
++    [[nodiscard]] const ObjectDescriptor* find(std::string_view name) const noexcept;
++
+     const ObjectDescriptor& descriptor(ObjectHandle handle) const;
+     PayloadSpan payload(ObjectHandle handle) const;
+     void materialize_on_device(ObjectHandle handle);
+--- a/src/artifact/reader.cpp
++++ b/src/artifact/reader.cpp
+@@ -102,6 +102,8 @@
+     if (name == "Q5G64_F16S") { return NumericFormat::Q5G64_F16S; }
+     if (name == "Q6G64_F16S") { return NumericFormat::Q6G64_F16S; }
+     if (name == "W8G32_F16S") { return NumericFormat::W8G32_F16S; }
++    if (name == "PTQ1_0_G128") { return NumericFormat::PTQ1_0_G128; }
++    if (name == "PQ2_0_G128") { return NumericFormat::PQ2_0_G128; }
+     throw ArtifactError("unknown tensor format: " + std::string(name));
+ }
+ 
+--- a/src/artifact/reader.h
++++ b/src/artifact/reader.h
+@@ -26,6 +26,9 @@
+     Q5G64_F16S,
+     Q6G64_F16S,
+     W8G32_F16S,
++    // Prism 私有三元格式（组宽 128）；见 core/tensor.h 中 QType 的编号说明。
++    PTQ1_0_G128,
++    PQ2_0_G128,
+ };
+ 
+ enum class StorageLayout {
+--- a/src/artifact/storage_layouts.cpp
++++ b/src/artifact/storage_layouts.cpp
+@@ -43,6 +43,13 @@
+         return {64, 32, 16};
+     case NumericFormat::W8G32_F16S:
+         return {32, 32, 0};
++    // Prism 三元：128 权重一组 -> 基平面 {qs} + 高位平面 {qh} + fp16 缩放。
++    // PTQ1_0 = 24 B base-3 三值（5/字节）+ 2 B 补充三值（4/字节）+ 2 B scale = 28 B/128。
++    case NumericFormat::PTQ1_0_G128:
++        return {128, 24, 2};
++    // PQ2_0 = 32 B 的 2-bit 码（无高位平面）+ 2 B scale = 34 B/128。
++    case NumericFormat::PQ2_0_G128:
++        return {128, 32, 0};
+     default:
+         throw ArtifactError("row-split-k128-v1 requires a grouped quantized format");
+     }
+@@ -78,6 +85,10 @@
+         return "Q6G64_F16S";
+     case NumericFormat::W8G32_F16S:
+         return "W8G32_F16S";
++    case NumericFormat::PTQ1_0_G128:
++        return "PTQ1_0_G128";
++    case NumericFormat::PQ2_0_G128:
++        return "PQ2_0_G128";
+     }
+     return {};
+ }
+--- a/src/artifact/typed_binding.cpp
++++ b/src/artifact/typed_binding.cpp
+@@ -20,6 +20,8 @@
+     case NumericFormat::Q5G64_F16S:
+     case NumericFormat::Q6G64_F16S:
+     case NumericFormat::W8G32_F16S:
++    case NumericFormat::PTQ1_0_G128:
++    case NumericFormat::PQ2_0_G128:
+         return StorageLayout::RowSplitK128V1;
+     }
+     throw std::logic_error("unhandled numeric format");
+@@ -41,6 +43,10 @@
+         return QType::Q6G64_F16S;
+     case NumericFormat::W8G32_F16S:
+         return QType::W8G32_F16S;
++    case NumericFormat::PTQ1_0_G128:
++        return QType::PTQ1_0_G128;
++    case NumericFormat::PQ2_0_G128:
++        return QType::PQ2_0_G128;
+     }
+     throw std::logic_error("unhandled numeric format");
+ }
+--- a/src/core/tensor.h
++++ b/src/core/tensor.h
+@@ -35,6 +35,11 @@
+     BF16_CTRL  = 4,
+     FP32_CTRL  = 5,
+     I32_CTRL   = 6,
++    // Prism 私有三元格式（Bonsai 2 27B）：组宽 128，base-3 三值码 / 2-bit 码。
++    // 取值 9/10 与 Ada（sm_89）线保持一致 —— 那条线上 7/8 已被 NVFP4 / FP8_E4M3FN_ROW_BF16S
++    // 占用；本线暂未携带这两个格式，留空以免将来并入时与本处冲突。
++    PTQ1_0_G128 = 9,
++    PQ2_0_G128  = 10,
+ };
+ 
+ enum class QuantLayout : std::uint16_t {
+@@ -62,6 +67,27 @@
+     DType scale_dtype        = DType::FP32;
+     std::int32_t scale_ne[4] = {1, 1, 1, 1};
+     std::int64_t scale_nb[4] = {0, 0, 0, 0};
++
++    // 三元权重以"折叠进旋转基"的形式存储：模型实际计算 y = W' * (H * (s * P * x))，
++    // 因此每一路喂给折叠权重的激活，都必须在乘之前先经过 (符号, 归一化 Sylvester-Hadamard)
++    // 映射；而词嵌入查表得到的行，必须在之后用同一变换的逆映射回原始基。
++    //
++    // hadamard_signs 指向"本权重输入宽度"对应的符号块（每个宽度占 k/1024 行、每行 1024 个
++    // F32 的 ±1），行号由激活所在的 1024 分块下标选出；nullptr 表示不做变换。
++    // hadamard_n_blk = k/1024。
++    const float* hadamard_signs = nullptr;
++    std::int32_t hadamard_n_blk = 0;
++
++    // 折叠基的特征置换 P，作用在符号与旋转之前：
++    //
++    //     x.view(perm_hd, perm_nk, perm_rep) -> 交换后两轴 -> flatten
++    //
++    // 只有 GDN 输出投影是"分组列"存储、而运行时产出的是分块 v-head，故只有它需要
++    // perm_rep > 1，其余权重一律留 1。几何来自模型头数：
++    // perm_hd = K/n_v，perm_nk = n_k，perm_rep = n_v/n_k。
++    std::int32_t hadamard_perm_hd  = 0;
++    std::int32_t hadamard_perm_nk  = 0;
++    std::int32_t hadamard_perm_rep = 1;
+ };
+ 
+ } // namespace ninfer
+--- a/src/ops/kernel/embed_gather.cuh
++++ b/src/ops/kernel/embed_gather.cuh
+@@ -1,6 +1,7 @@
+ #pragma once
+ 
+ #include "ops/common/math.h"
++#include "ops/linear/ternary/ternary_rowsplit_storage.cuh"
+ 
+ // ninfer::ops - embedding kernels. Dense copies BF16 rows; Q6 decodes
+ // ROW_SPLIT nibble, high, and scale planes.
+@@ -179,4 +180,34 @@
+     }
+ }
+ 
++// Prism 三元词表（组宽 128）。一个线程解出一个输出元素：先由 token id 定位源行，再定位该元素
++// 所属的 128 权重组，然后把该组的三个平面指针交给与三元线性层【同一个】解码原子 —— 这样词表与
++// 线性权重不可能各解各的。PQ2_0 传 high == nullptr（row_split_geometry 为它报的高位平面字节数为
++// 零）；PTQ1_0 从高位平面读 qh。
++template <class Storage, class Atom>
++__global__ void embed_gather_ternary_kernel(const std::int32_t* ids, const std::uint8_t* codes,
++                                            const std::uint8_t* high, const std::uint8_t* scales,
++                                            __nv_bfloat16* out, std::int32_t d, std::int32_t T,
++                                            std::int32_t padded_d) {
++    const std::int32_t kg     = padded_d / Storage::kGroupK;
++    const std::int64_t n      = static_cast<std::int64_t>(d) * T;
++    const std::int64_t start  = blockIdx.x * static_cast<std::int64_t>(blockDim.x) + threadIdx.x;
++    const std::int64_t stride = static_cast<std::int64_t>(gridDim.x) * blockDim.x;
++
++    for (std::int64_t i = start; i < n; i += stride) {
++        const std::int32_t t    = static_cast<std::int32_t>(i / d);
++        const std::int32_t k    = static_cast<std::int32_t>(i - static_cast<std::int64_t>(t) * d);
++        const std::int32_t row  = ids[t];
++        const std::int32_t g    = k / Storage::kGroupK;
++        const std::int32_t lane = k - g * Storage::kGroupK;
++        const std::int64_t group_index = static_cast<std::int64_t>(row) * kg + g;
++
++        const std::uint8_t* group_codes = codes + group_index * Storage::kCodeBytesPerGroup;
++        const std::uint8_t* group_high =
++            high == nullptr ? nullptr : high + group_index * Storage::kHighBytesPerGroup;
++        const float scale = Atom::load_scale(scales + group_index * Storage::kScaleBytesPerGroup);
++        out[i]            = __float2bfloat16(Atom::decode_one(group_codes, group_high, scale, lane));
++    }
++}
++
+ } // namespace ninfer::ops
+--- a/src/ops/kv_cache/hadamard_d256.cuh
++++ b/src/ops/kv_cache/hadamard_d256.cuh
+@@ -0,0 +1,67 @@
++#pragma once
++
++#include <cuda_runtime.h>
++
++namespace ninfer::ops {
++
++// Apply the five lane dimensions of a Sylvester transform to independent columns. Keeping the
++// column loop inside each stage exposes their independent shuffle instructions while preserving
++// the butterfly and rounding order of every column.
++template <int Columns>
++__device__ __forceinline__ void hadamard_d32_columns_inplace(float (&values)[Columns], int lane) {
++    constexpr unsigned FullMask = 0xffffffffu;
++
++#pragma unroll
++    for (int stride = 1; stride <= 16; stride <<= 1) {
++#pragma unroll
++        for (int column = 0; column < Columns; ++column) {
++            const float value = values[column];
++            const float peer  = __shfl_xor_sync(FullMask, value, stride);
++            values[column] = (lane & stride) == 0 ? __fadd_rn(value, peer) : __fsub_rn(peer, value);
++        }
++    }
++}
++
++// Factorized H256 support for latency-oriented kernels that distribute one D256 row across four
++// G64 warps. The H64 fragments are intentionally unnormalized; the final H4 leaf applies 2^-4.
++__device__ __forceinline__ void hadamard_d64_fragment_inplace(float (&values)[2], int lane) {
++    hadamard_d32_columns_inplace(values, lane);
++    const float low  = values[0];
++    const float high = values[1];
++    values[0]        = __fadd_rn(low, high);
++    values[1]        = __fsub_rn(low, high);
++}
++
++__device__ __forceinline__ float
++normalized_hadamard_d256_group_value_from_h64(float x0, float x1, float x2, float x3, int group) {
++    const float y0  = (group & 1) == 0 ? __fadd_rn(x0, x1) : __fsub_rn(x0, x1);
++    const float y1  = (group & 1) == 0 ? __fadd_rn(x2, x3) : __fsub_rn(x2, x3);
++    const float out = (group & 2) == 0 ? __fadd_rn(y0, y1) : __fsub_rn(y0, y1);
++    return __fmul_rn(out, 0x1p-4f);
++}
++
++// One full warp owns one D256 row. Lane l carries dimensions l+32*r in values[r]. The fixed
++// normalized Sylvester transform is shared by persistent K preparation and transient Q
++// preparation; it never materializes an intermediate row outside registers.
++__device__ __forceinline__ void normalized_hadamard_d256_inplace(float (&values)[8], int lane) {
++    hadamard_d32_columns_inplace(values, lane);
++
++#pragma unroll
++    for (int span = 1; span < 8; span <<= 1) {
++#pragma unroll
++        for (int base = 0; base < 8; base += 2 * span) {
++#pragma unroll
++            for (int offset = 0; offset < span; ++offset) {
++                const float low              = values[base + offset];
++                const float high             = values[base + offset + span];
++                values[base + offset]        = __fadd_rn(low, high);
++                values[base + offset + span] = __fsub_rn(low, high);
++            }
++        }
++    }
++
++#pragma unroll
++    for (float& value : values) { value = __fmul_rn(value, 0x1p-4f); }
++}
++
++} // namespace ninfer::ops
+--- a/src/ops/launcher/embed_gather.cu
++++ b/src/ops/launcher/embed_gather.cu
+@@ -28,6 +28,19 @@
+                                                           static_cast<std::int64_t>(group_blocks)));
+ }
+ 
++// 必须放在 grid_for() 之后，模板才能调用它。
++template <class Storage, class Atom>
++void launch_ternary(const Tensor& ids, const Weight& table, Tensor& out, cudaStream_t stream) {
++    const std::int32_t d = out.ne[0];
++    const std::int32_t T = ids.ne[0];
++    const std::int64_t n = static_cast<std::int64_t>(d) * T;
++    embed_gather_ternary_kernel<Storage, Atom><<<grid_for(n), kBlock, 0, stream>>>(
++        static_cast<const std::int32_t*>(ids.data), static_cast<const std::uint8_t*>(table.qdata),
++        static_cast<const std::uint8_t*>(table.qhigh), static_cast<const std::uint8_t*>(table.scales),
++        static_cast<__nv_bfloat16*>(out.data), d, T, table.padded_shape[1]);
++    CUDA_CHECK(cudaGetLastError());
++}
++
+ } // namespace
+ 
+ const char* w8_embed_route_name(W8EmbedRoute route) {
+@@ -112,4 +125,14 @@
+     CUDA_CHECK(cudaGetLastError());
+ }
+ 
++void embed_gather_pq2_launch(const Tensor& ids, const Weight& table, Tensor& out,
++                             cudaStream_t stream) {
++    launch_ternary<PQ2RowSplitStorage, PQ2SimtDecodeAtom>(ids, table, out, stream);
++}
++
++void embed_gather_ptq1_launch(const Tensor& ids, const Weight& table, Tensor& out,
++                              cudaStream_t stream) {
++    launch_ternary<PTQ1RowSplitStorage, PTQ1SimtDecodeAtom>(ids, table, out, stream);
++}
++
+ } // namespace ninfer::ops::detail
+--- a/src/ops/launcher/embed_gather.h
++++ b/src/ops/launcher/embed_gather.h
+@@ -20,6 +20,11 @@
+                             cudaStream_t stream);
+ void embed_gather_w8_launch(const Tensor& ids, const Weight& table, Tensor& out,
+                             cudaStream_t stream);
++// Prism 三元词表（组宽 128）。PQ2_0 没有高位平面；PTQ1_0 的 qh 就在高位平面里。
++void embed_gather_pq2_launch(const Tensor& ids, const Weight& table, Tensor& out,
++                             cudaStream_t stream);
++void embed_gather_ptq1_launch(const Tensor& ids, const Weight& table, Tensor& out,
++                              cudaStream_t stream);
+ void embed_gather_w8_2048_launch(const Tensor& ids, const Weight& table, Tensor& out,
+                                  W8EmbedRoute route, cudaStream_t stream);
+ const char* w8_embed_route_name(W8EmbedRoute route);
+--- a/src/ops/linear/linear.cpp
++++ b/src/ops/linear/linear.cpp
+@@ -5,6 +5,8 @@
+ #include "ops/linear/q4/q4_dispatch.h"
+ #include "ops/linear/q5/q5_dispatch.h"
+ #include "ops/linear/q6/q6_dispatch.h"
++#include "ops/linear/ternary/ternary_dispatch.h"
++#include "ops/linear/ternary/ternary_rotation.h"
+ #include "ops/linear/w8/w8_dispatch.h"
+ 
+ #include <cstdint>
+@@ -91,6 +93,10 @@
+     case QType::BF16_CTRL:
+         detail::bf16_dispatch(x, w, out, policy, stream);
+         return;
++    case QType::PTQ1_0_G128:
++    case QType::PQ2_0_G128:
++        detail::ternary_dispatch(x, w, out, policy, workspace, stream);
++        return;
+     case QType::FP32_CTRL:
+     case QType::I32_CTRL:
+         break;
+@@ -129,6 +135,15 @@
+         (void)detail::select_bf16_launch(output_rows, input_rows, min_tokens, policy);
+         (void)detail::select_bf16_launch(output_rows, input_rows, max_tokens, policy);
+         return 0;
++    case QType::PTQ1_0_G128:
++    case QType::PQ2_0_G128:
++        // GEMM 本身在核里解码、不需要工作区，折叠基需要：激活必须在矩阵乘之前映射进旋转基
++        // （先 P、再符号、再归一化 Hadamard），而那需要一块 [K, T] 的 BF16 scratch。这里若不
++        // 列出这两个格式，每个三元权重都会在进入分派之前死在
++        // "linear workspace: unsupported weight qtype"。
++        (void)detail::select_ternary_launch(output_rows, input_rows, min_tokens, policy);
++        (void)detail::select_ternary_launch(output_rows, input_rows, max_tokens, policy);
++        return detail::ternary_rotation_workspace_bytes(input_rows, max_tokens);
+     case QType::FP32_CTRL:
+     case QType::I32_CTRL:
+         break;
+--- a/src/ops/linear/ternary/ternary_dispatch.cpp
++++ b/src/ops/linear/ternary/ternary_dispatch.cpp
+@@ -0,0 +1,78 @@
++// MODIFIED for the NInfer ternary port (Ternary Bonsai 2 27B on NInfer / Ada sm_89).
++// This file differs from upstream NInfer; see patches/ in the release bundle
++// for the change list, rebuild steps and required verification.
++#include "ops/linear/ternary/ternary_dispatch.h"
++
++#include "ops/linear/ternary/ternary_rotation.h"
++#include "ops/linear/ternary/ternary_rowsplit_storage.cuh"
++
++#include <stdexcept>
++#include <string>
++
++namespace ninfer::ops::detail {
++
++TernaryLaunch select_ternary_launch(std::int32_t n, std::int32_t k, std::int32_t t,
++                                    LinearPolicy policy) {
++    if (n <= 0 || k <= 0 || t <= 0) {
++        throw std::invalid_argument("ternary linear: unsupported shape or T");
++    }
++    // The reference kernel decodes whole 128-weight groups, so K has to be a whole number
++    // of them. Every width the model uses (5120, 6144, 10240, 17408) satisfies this, and
++    // row_split_geometry() pads to the same 128 boundary, so no padding groups exist.
++    if (k % PTQ1RowSplitStorage::kGroupK != 0) {
++        throw std::invalid_argument("ternary linear: K must be a multiple of the group size");
++    }
++    switch (policy) {
++    case LinearPolicy::A16Only:
++    case LinearPolicy::AllowA8:
++    case LinearPolicy::AllowA4:
++        break;
++    }
++    // Both ternary formats take the same schedule; the atom is chosen from w.qtype inside
++    // the launch. Decode (T = 1) and small prefill use different token tiles.
++    return t == 1 ? launch_ternary_gemm_t1 : launch_ternary_gemm_t8;
++}
++
++void ternary_dispatch_basis_strided(const Tensor& x_folded, const Weight& w, Tensor& out,
++                                    std::int32_t out_row_stride, LinearPolicy policy,
++                                    cudaStream_t stream) {
++    const TernaryLaunch launch = select_ternary_launch(w.n, w.k, x_folded.ne[1], policy);
++    launch(x_folded, w, out, out_row_stride, stream);
++}
++
++void ternary_dispatch_basis(const Tensor& x_folded, const Weight& w, Tensor& out,
++                            LinearPolicy policy, cudaStream_t stream) {
++    ternary_dispatch_basis_strided(x_folded, w, out, w.n, policy, stream);
++}
++
++void ternary_dispatch(const Tensor& x, const Weight& w, Tensor& out, LinearPolicy policy,
++                      WorkspaceArena* workspace, cudaStream_t stream) {
++    const TernaryLaunch launch = select_ternary_launch(w.n, w.k, x.ne[1], policy);
++
++    if (!ternary_rotation_enabled()) {
++        // NINFER_TERNARY_HADAMARD=0: run the GEMM against the raw activation so the full forward
++        // pass (and therefore the M4 decode speed) is measurable. The result is numerically
++        // meaningless -- the activation is in the wrong basis -- which is the point: it separates
++        // "the ternary decode is broken" from "the rotation is broken" without a rebuild.
++        launch(x, w, out, w.n, stream);
++        return;
++    }
++    if (workspace == nullptr) {
++        // Name the shape in the message: a folded ternary weight reaching the workspace-free
++        // entry point is a call-site wiring gap, and the shape is what identifies the weight.
++        throw std::invalid_argument(
++            "ternary linear: the folded basis needs a rotation workspace [N=" +
++            std::to_string(w.n) + ", K=" + std::to_string(w.k) + ", T=" +
++            std::to_string(x.ne[1]) + ", qtype=" + std::to_string(static_cast<int>(w.qtype)) + "]");
++    }
++
++    // Scoped: the scratch is handed back when this op returns, so it does not accumulate across
++    // the (many) graph constructions of one load. Sequential reuse on one stream is safe.
++    // folded_activation() rejects a ternary weight with no sign block, so an unfolded artifact
++    // fails loudly here instead of silently multiplying by unfolded weights.
++    auto scope              = workspace->scope();
++    const Tensor activation = folded_activation(x, w, *workspace, stream);
++    launch(activation, w, out, w.n, stream);
++}
++
++} // namespace ninfer::ops::detail
+--- a/src/ops/linear/ternary/ternary_dispatch.h
++++ b/src/ops/linear/ternary/ternary_dispatch.h
+@@ -0,0 +1,34 @@
++// MODIFIED for the NInfer ternary port (Ternary Bonsai 2 27B on NInfer / Ada sm_89).
++// This file differs from upstream NInfer; see patches/ in the release bundle
++// for the change list, rebuild steps and required verification.
++#pragma once
++
++#include "core/arena.h"
++#include "ninfer/ops/linear.h"
++#include "ops/linear/ternary/ternary_launch.h"
++
++#include <cstdint>
++
++namespace ninfer::ops::detail {
++
++TernaryLaunch select_ternary_launch(std::int32_t n, std::int32_t k, std::int32_t t,
++                                    LinearPolicy policy);
++
++// Rotate the activation into the folded basis when the weight needs it, then run the GEMM.
++void ternary_dispatch(const Tensor& x, const Weight& w, Tensor& out, LinearPolicy policy,
++                      WorkspaceArena* workspace, cudaStream_t stream);
++
++// Run the GEMM when the activation is ALREADY in the folded basis. Callers that feed several
++// folded weights from one activation (the split GDN input projection feeds three) rotate once and
++// then call this, instead of paying for -- and diverging on -- a redundant rotation per weight.
++void ternary_dispatch_basis(const Tensor& x_folded, const Weight& w, Tensor& out,
++                            LinearPolicy policy, cudaStream_t stream);
++
++// Same, for a weight that writes a ROW RANGE of a larger fused output. `out` must already point at
++// the range start (Tensor::slice over ne[0], the contiguous axis, does that) and out_row_stride is
++// the parent's row count -- which is also the token stride under ninfer's ne[0]-contiguous layout.
++void ternary_dispatch_basis_strided(const Tensor& x_folded, const Weight& w, Tensor& out,
++                                    std::int32_t out_row_stride, LinearPolicy policy,
++                                    cudaStream_t stream);
++
++} // namespace ninfer::ops::detail
+--- a/src/ops/linear/ternary/ternary_launch.h
++++ b/src/ops/linear/ternary/ternary_launch.h
+@@ -0,0 +1,26 @@
++// MODIFIED for the NInfer ternary port (Ternary Bonsai 2 27B on NInfer / Ada sm_89).
++// This file differs from upstream NInfer; see patches/ in the release bundle
++// for the change list, rebuild steps and required verification.
++#pragma once
++
++#include "core/tensor.h"
++
++#include <cuda_runtime.h>
++
++namespace ninfer::ops::detail {
++
++// The token tile is the only schedule knob on the reference path: one token per CTA at
++// T = 1 (decode), eight otherwise (a small prefill). Both share one kernel template.
++//
++// out_row_stride is the row count of the OUT tensor's parent allocation (the token stride), so a
++// caller can have several weights write disjoint row ranges of one fused output -- the split GDN
++// and attention parents do exactly that. Pass w.n when the output is the whole tensor.
++using TernaryLaunch = void (*)(const Tensor&, const Weight&, Tensor&, std::int32_t,
++                               cudaStream_t);
++
++void launch_ternary_gemm_t1(const Tensor& x, const Weight& w, Tensor& out,
++                            std::int32_t out_row_stride, cudaStream_t stream);
++void launch_ternary_gemm_t8(const Tensor& x, const Weight& w, Tensor& out,
++                            std::int32_t out_row_stride, cudaStream_t stream);
++
++} // namespace ninfer::ops::detail
+--- a/src/ops/linear/ternary/ternary_rotation.cpp
++++ b/src/ops/linear/ternary/ternary_rotation.cpp
+@@ -0,0 +1,73 @@
++// MODIFIED for the NInfer ternary port (Ternary Bonsai 2 27B on NInfer / Ada sm_89).
++// This file differs from upstream NInfer; see patches/ in the release bundle
++// for the change list, rebuild steps and required verification.
++#include "ops/linear/ternary/ternary_rotation.h"
++
++#include <cstdlib>
++#include <stdexcept>
++#include <string>
++
++namespace ninfer::ops::detail {
++namespace {
++
++constexpr std::size_t kActivationBytesPerElement = 2; // BF16
++
++bool ternary_qtype(QType qtype) noexcept {
++    return qtype == QType::PTQ1_0_G128 || qtype == QType::PQ2_0_G128;
++}
++
++} // namespace
++
++bool ternary_weight_is_folded(const Weight& weight) noexcept {
++    return ternary_qtype(weight.qtype) && weight.hadamard_signs != nullptr &&
++           weight.hadamard_n_blk > 0;
++}
++
++bool ternary_rotation_enabled() {
++    // Read once: the value must not change between graph construction and graph replay, because
++    // the rotation decides whether a kernel appears in the captured graph at all.
++    static const bool enabled = [] {
++        const char* value = std::getenv("NINFER_TERNARY_HADAMARD");
++        return value == nullptr || std::string(value) != "0";
++    }();
++    return enabled;
++}
++
++bool ternary_gdn_perm_enabled() {
++    // Default OFF: this port's packer already normalized every GDN tensor to the grouped order,
++    // so the reference's feature permutation would be a second permutation. See the header.
++    static const bool enabled = [] {
++        const char* value = std::getenv("NINFER_TERNARY_GDN_PERM");
++        return value != nullptr && std::string(value) == "1";
++    }();
++    return enabled;
++}
++
++std::size_t ternary_rotation_workspace_bytes(std::int32_t k, std::int32_t tokens) {
++    if (k <= 0 || tokens <= 0) { return 0; }
++    return static_cast<std::size_t>(k) * static_cast<std::size_t>(tokens) *
++           kActivationBytesPerElement;
++}
++
++std::size_t ternary_projection_workspace_bytes(std::int32_t output_rows, std::int32_t input_rows,
++                                               std::int32_t tokens) {
++    return ternary_rotation_workspace_bytes(output_rows, tokens) +
++           ternary_rotation_workspace_bytes(input_rows, tokens);
++}
++
++Tensor folded_activation(const Tensor& x, const Weight& weight, WorkspaceArena& workspace,
++                         cudaStream_t stream) {
++    if (!ternary_rotation_enabled()) { return x; }
++    if (!ternary_weight_is_folded(weight)) {
++        throw std::invalid_argument(
++            "folded ternary weight has no sign block; the artifact must carry "
++            "text/hadamard_signs and text/hadamard_widths");
++    }
++    const DeviceSpan span =
++        workspace.alloc_bytes(ternary_rotation_workspace_bytes(weight.k, x.ne[1]));
++    Tensor rotated(span.data, DType::BF16, {weight.k, x.ne[1]});
++    launch_ternary_rotation(x, rotated, weight, stream);
++    return rotated;
++}
++
++} // namespace ninfer::ops::detail
+--- a/src/ops/linear/ternary/ternary_rotation.cu
++++ b/src/ops/linear/ternary/ternary_rotation.cu
+@@ -0,0 +1,110 @@
++// MODIFIED for the NInfer ternary port (Ternary Bonsai 2 27B on NInfer / Ada sm_89).
++// This file differs from upstream NInfer; see patches/ in the release bundle
++// for the change list, rebuild steps and required verification.
++#include "ops/linear/ternary/ternary_rotation.h"
++
++#include "core/device.h"
++#include "ops/linear/ternary/ternary_rotation_kernels.cuh"
++
++#include <cuda_bf16.h>
++#include <cuda_runtime.h>
++
++#include <cstdint>
++#include <stdexcept>
++#include <string>
++
++namespace ninfer::ops::detail {
++namespace {
++
++static_assert(sizeof(__nv_bfloat16) == 2, "the rotation workspace math assumes a 2-byte BF16");
++
++// Shared validation for both directions: the transform width, the matching sign block, and the
++// [k, tokens] BF16 activation.
++void require_rotation_operands(const Tensor& x, const Weight& weight, const char* what) {
++    const std::int32_t k      = weight.k;
++    const std::int32_t tokens = x.ne[1];
++
++    if (k <= 0 || tokens <= 0) {
++        throw std::invalid_argument(std::string(what) + ": K and tokens must be positive");
++    }
++    if ((k % kBlockSize) != 0) {
++        throw std::invalid_argument(std::string(what) +
++                                    ": K must be a multiple of the block size");
++    }
++    if (weight.hadamard_signs == nullptr || weight.hadamard_n_blk <= 0) {
++        throw std::invalid_argument(std::string(what) + ": weight carries no sign block");
++    }
++    if (weight.hadamard_n_blk != k / kBlockSize) {
++        throw std::invalid_argument(std::string(what) +
++                                    ": sign row count does not match the input width");
++    }
++    if (x.dtype != DType::BF16 || x.data == nullptr) {
++        throw std::invalid_argument(std::string(what) + ": activation must be BF16");
++    }
++    if (x.ne[0] != k) {
++        throw std::invalid_argument(std::string(what) +
++                                    ": activation width does not match K");
++    }
++}
++
++unsigned rotation_grid(std::int32_t k, std::int32_t tokens) {
++    const std::int64_t warps =
++        static_cast<std::int64_t>(k / kBlockSize) * static_cast<std::int64_t>(tokens);
++    return static_cast<unsigned>((warps + kWarpsPerBlock - 1) / kWarpsPerBlock);
++}
++
++} // namespace
++
++void launch_ternary_rotation(const Tensor& x, Tensor& out, const Weight& weight,
++                             cudaStream_t stream) {
++    require_rotation_operands(x, weight, "ternary rotation");
++    if (out.dtype != DType::BF16 || out.data == nullptr) {
++        throw std::invalid_argument("ternary rotation: out must be BF16");
++    }
++    if (out.ne[0] != weight.k || out.ne[1] != x.ne[1]) {
++        throw std::invalid_argument("ternary rotation: expected [K,T] x and [K,T] out");
++    }
++
++    // The permutation is only admitted when its geometry actually spans the input width; a
++    // partially declared permutation would silently transform a malformed basis. It is applied only
++    // when the artifact is known to be tile-ordered (see ternary_gdn_perm_enabled()).
++    const bool permuted = ternary_gdn_perm_enabled() && weight.hadamard_perm_rep > 1;
++    if (permuted) {
++        const std::int64_t span = static_cast<std::int64_t>(weight.hadamard_perm_hd) *
++                                  weight.hadamard_perm_nk * weight.hadamard_perm_rep;
++        if (weight.hadamard_perm_hd <= 0 || weight.hadamard_perm_nk <= 0 ||
++            span != weight.k) {
++            throw std::invalid_argument(
++                "ternary rotation: folded permutation geometry does not span K");
++        }
++    }
++    const std::int32_t perm_hd  = permuted ? weight.hadamard_perm_hd : 0;
++    const std::int32_t perm_nk  = permuted ? weight.hadamard_perm_nk : 0;
++    const std::int32_t perm_rep = permuted ? weight.hadamard_perm_rep : 1;
++
++    ternary_rotate_bf16_kernel<<<rotation_grid(weight.k, x.ne[1]),
++                                 kWarpsPerBlock * kThreadsPerWarp, 0, stream>>>(
++        static_cast<const __nv_bfloat16*>(x.data), static_cast<__nv_bfloat16*>(out.data),
++        weight.hadamard_signs, weight.hadamard_n_blk, weight.k, x.ne[1], perm_hd, perm_nk,
++        perm_rep, /*inverse=*/0);
++    CUDA_CHECK(cudaGetLastError());
++}
++
++void launch_ternary_rotation_inverse_inplace(Tensor& data, const Weight& weight,
++                                             cudaStream_t stream) {
++    require_rotation_operands(data, weight, "ternary rotation (inverse)");
++    // The token-embedding table is the only inverse-mapped weight and carries no permutation
++    // (llama-model.cpp gates P on `.ssm_out.` alone), so one declared here is a contract error.
++    if (weight.hadamard_perm_rep > 1) {
++        throw std::invalid_argument(
++            "ternary rotation: the embedding path does not carry a folded permutation");
++    }
++
++    ternary_rotate_inverse_inplace_bf16_kernel<<<rotation_grid(weight.k, data.ne[1]),
++                                                 kWarpsPerBlock * kThreadsPerWarp, 0, stream>>>(
++        static_cast<__nv_bfloat16*>(data.data), weight.hadamard_signs, weight.hadamard_n_blk,
++        weight.k, data.ne[1]);
++    CUDA_CHECK(cudaGetLastError());
++}
++
++} // namespace ninfer::ops::detail
+--- a/src/ops/linear/ternary/ternary_rotation.h
++++ b/src/ops/linear/ternary/ternary_rotation.h
+@@ -0,0 +1,104 @@
++// MODIFIED for the NInfer ternary port (Ternary Bonsai 2 27B on NInfer / Ada sm_89).
++// This file differs from upstream NInfer; see patches/ in the release bundle
++// for the change list, rebuild steps and required verification.
++#pragma once
++
++#include "core/arena.h"
++#include "core/tensor.h"
++
++#include <cuda_runtime.h>
++
++#include <cstddef>
++#include <cstdint>
++
++namespace ninfer::ops::detail {
++
++// Folded (rotated) ternary basis support for the Prism/Bonsai ports.
++//
++// The ternary linear weights are stored folded into a rotated basis, so the model computes
++//
++//     y = W' * (H * (s * P * x))
++//
++// where P is an optional column permutation (only the GDN output projection carries one), s is
++// an explicit +-1 diagonal, and H is the normalized Sylvester-Hadamard transform over blocks of
++// 1024. Everything below is driven by data the binder already attached to Weight
++// (hadamard_signs / hadamard_n_blk / hadamard_perm_*), so the op layer never needs to know which
++// model layers are folded: `qtype` alone decides.
++//
++// The transform is applied to the ACTIVATION, never to the weight. Folding H and s back into W
++// would make W a dense float matrix (`W = W' * H * s`), which is not ternary representable and
++// would re-inflate the artifact from 7 GB to ~17 GB -- the exact failure mode this port exists
++// to avoid.
++
++// True when this weight's activation must be mapped into the folded basis. False for every
++// non-ternary weight, which is why the non-ternary pipelines are unaffected.
++[[nodiscard]] bool ternary_weight_is_folded(const Weight& weight) noexcept;
++
++// NINFER_TERNARY_HADAMARD=0 disables the transform at run time.
++//
++// This is the bisection switch between the two ways an end-to-end ternary run can be wrong:
++// decode errors (wrong codes / wrong scale / wrong row order) and rotation errors (wrong
++// butterfly, wrong sign row, wrong permutation). With the transform off, the engine still runs
++// the full forward pass and still reports a decode speed, so the M4 throughput number can be
++// measured before the transform is trusted; the output is numerically meaningless either way,
++// and a perplexity that is *not* in the hundreds is the signal that the rotation is correct.
++[[nodiscard]] bool ternary_rotation_enabled();
++
++// Whether the folded GDN feature permutation P is applied.
++//
++// llama.cpp applies P because ITS runtime keeps the GDN V channels tiled, matching the GGUF's
++// `attn_qkv` row order, while the folded `ssm_out` keeps its training (grouped) column order
++// (`conversion/qwen.py:617-626`). The GGUF metadata records this as
++// `prism.hadamard.gdn_v_grouped = 1` -- "v is already grouped, do not permute a second time".
++//
++// This port's packer normalizes EVERY GDN tensor to the grouped (HF) order: `gdn/value_z` applies
++// tiled->grouped to the attn_qkv V rows and to attn_gate, and `ssm_conv1d`/`ssm_alpha`/`ssm_beta`
++// are reordered the same way. The runtime therefore already produces grouped V, so applying P here
++// permutes a SECOND time and scrambles 48 of the 64 layers.
++//
++// Default: off. NINFER_TERNARY_GDN_PERM=1 restores the llama.cpp behaviour, which is what a
++// tile-ordered artifact would need.
++[[nodiscard]] bool ternary_gdn_perm_enabled();
++
++// Device bytes needed to hold a rotated activation of shape [k, tokens], BF16.
++[[nodiscard]] std::size_t ternary_rotation_workspace_bytes(std::int32_t k, std::int32_t tokens);
++
++// Bytes a fused family needs to decompose into a ternary GEMM: a scoped [output_rows, tokens]
++// BF16 projection scratch (the GEMM writes [N, T] and the family's epilogue then folds it in) plus
++// the [input_rows, tokens] rotation buffer the GEMM maps the activation through.
++[[nodiscard]] std::size_t ternary_projection_workspace_bytes(std::int32_t output_rows,
++                                                             std::int32_t input_rows,
++                                                             std::int32_t tokens);
++
++// Map `x` ([k, tokens], BF16) into the folded basis of `weight`, writing [k, tokens] BF16.
++// Applies P, then the signs, then H: out = H * (s * (P * x)).
++void launch_ternary_rotation(const Tensor& x, Tensor& out, const Weight& weight,
++                             cudaStream_t stream);
++
++// Inverse for the token-embedding path: `out = s * (H * x)`, applied IN PLACE to a [k, tokens]
++// BF16 activation.
++//
++// The embedding table stores its rows folded into the rotated basis, so the looked-up rows must be
++// mapped back before they can enter the residual stream. There is no permutation on this path
++// (llama-model.cpp gates P on `.ssm_out.` alone), and H and s are both involutions, so the inverse
++// is the same transform with the sign multiply on the other side.
++//
++// In place on purpose: the gathered embedding is a freshly produced activation that nothing else
++// reads, so mapping it in place costs no scratch buffer at all -- which matters because the
++// embedding op has no workspace parameter.
++void launch_ternary_rotation_inverse_inplace(Tensor& data, const Weight& weight,
++                                            cudaStream_t stream);
++
++// Convenience wrapper around launch_ternary_rotation for callers that feed several folded weights
++// from one activation: allocates the scratch from `workspace` and returns the mapped activation.
++//
++// Returns `x` unchanged when NINFER_TERNARY_HADAMARD=0, and throws when the rotation is enabled
++// but the weight carries no sign block -- a folded weight without signs means the artifact is
++// missing text/hadamard_signs, and running it untransformed would produce plausible garbage.
++//
++// The CALLER owns the workspace scope: the returned Tensor points into the arena and stays valid
++// only until that scope ends.
++[[nodiscard]] Tensor folded_activation(const Tensor& x, const Weight& weight,
++                                       WorkspaceArena& workspace, cudaStream_t stream);
++
++} // namespace ninfer::ops::detail
+--- a/src/ops/linear/ternary/ternary_rotation_kernels.cuh
++++ b/src/ops/linear/ternary/ternary_rotation_kernels.cuh
+@@ -0,0 +1,167 @@
++// MODIFIED for the NInfer ternary port (Ternary Bonsai 2 27B on NInfer / Ada sm_89).
++// This file differs from upstream NInfer; see patches/ in the release bundle
++// for the change list, rebuild steps and required verification.
++#pragma once
++
++// Device kernels for the folded (rotated-basis) ternary transform.
++//
++// Split out of ternary_rotation.cu so a standalone nvcc harness can compile and exercise the
++// REAL kernels against a numpy oracle -- the transform is the one piece of this port that cannot
++// be validated by byte or size checks, and a wrong sign row, a wrong register span or a wrong
++// permutation all produce fluent-looking nonsense rather than an error.
++//
++// This header is self-contained on purpose: it includes only cuda_runtime.h, cuda_bf16.h and the
++// in-tree D256 building block (which itself only needs cuda_runtime.h), so the harness compiles it
++// without dragging in Tensor/Weight/arena.
++
++#include "ops/kv_cache/hadamard_d256.cuh"
++
++#include <cuda_bf16.h>
++#include <cuda_runtime.h>
++
++#include <cstdint>
++
++namespace ninfer::ops::detail {
++namespace {
++
++constexpr int kBlockSize      = 1024;
++constexpr int kWarpsPerBlock  = 8;
++constexpr int kThreadsPerWarp = 32;
++
++// D1024 = 32 lanes x 32 registers, i.e. exactly the in-tree D256 construction
++// (src/ops/kv_cache/hadamard_d256.cuh: 32 lanes x 8 registers, 3 register spans, 2^-4) with two
++// more register spans and 2^-5 = 1/sqrt(1024) as the normalizer. hadamard_d32_columns_inplace is
++// already templated on the register count, so the lane stages are reused verbatim rather than
++// copied -- the butterfly convention (low = x + y, high = x - y) therefore cannot drift.
++__device__ __forceinline__ void normalized_hadamard_d1024_inplace(float (&values)[32], int lane) {
++    hadamard_d32_columns_inplace(values, lane);
++
++#pragma unroll
++    for (int span = 1; span < 32; span <<= 1) {
++#pragma unroll
++        for (int base = 0; base < 32; base += 2 * span) {
++#pragma unroll
++            for (int offset = 0; offset < span; ++offset) {
++                const float low              = values[base + offset];
++                const float high             = values[base + offset + span];
++                values[base + offset]        = __fadd_rn(low, high);
++                values[base + offset + span] = __fsub_rn(low, high);
++            }
++        }
++    }
++
++#pragma unroll
++    for (float& value : values) { value = __fmul_rn(value, 0x1p-5f); }
++}
++
++// One warp owns one (1024-block, token) pair of the [k, tokens] activation. Lane l carries
++// dimensions l + 32*r of the block in values[r].
++//
++// LAYOUT: ninfer follows the ggml convention where ne[0] is the CONTIGUOUS axis, so an activation
++// tensor with ne = (k, tokens) stores element (column, token) at token * k + column -- TOKEN-major,
++// not row-major. Applying the transform with a k * tokens + t stride scrambles every prefill while
++// still passing any test at tokens == 1, where the two layouts coincide exactly.
++//
++// Forward (the folded weights read the activation):
++//     out = H * (s * (P * x))
++// The permutation P is a pure index permutation and is folded into the load. Given the post-P
++// column j, the source column is recovered as
++//     hd = j % perm_hd, q = j / perm_hd, nk = q / perm_rep, rep = q % perm_rep
++//     i  = hd + perm_hd * nk + perm_hd * perm_nk * rep
++// which is the inverse of llama-graph.cpp's reshape(perm_hd, perm_nk, perm_rep) + permute(0,2,1).
++__global__ void ternary_rotate_bf16_kernel(const __nv_bfloat16* __restrict__ x,
++                                           __nv_bfloat16* __restrict__ out,
++                                           const float* __restrict__ signs, int n_blk, int k,
++                                           int tokens, int perm_hd, int perm_nk, int perm_rep,
++                                           int inverse) {
++    const int lane   = threadIdx.x & (kThreadsPerWarp - 1);
++    const int warp   = static_cast<int>(blockIdx.x) * kWarpsPerBlock + (threadIdx.x >> 5);
++    const int blocks = k >> 10;
++    if (warp >= blocks * tokens) { return; }
++    const int block = warp % blocks;
++    const int token = warp / blocks;
++
++    const float* const signs_row  = signs + (block % n_blk) * kBlockSize;
++    const bool permuted           = !inverse && perm_rep > 1;
++    const __nv_bfloat16* x_token  = x + static_cast<std::int64_t>(token) * k;
++    __nv_bfloat16* out_token      = out + static_cast<std::int64_t>(token) * k;
++
++    float values[32];
++
++    if (inverse) {
++#pragma unroll
++        for (int r = 0; r < 32; ++r) {
++            values[r] = __bfloat162float(x_token[(block << 10) + r * 32 + lane]);
++        }
++    } else {
++#pragma unroll
++        for (int r = 0; r < 32; ++r) {
++            const int column = (block << 10) + r * 32 + lane;
++            int source       = column;
++            if (permuted) {
++                const int hd = column % perm_hd;
++                const int q  = column / perm_hd;
++                source = hd + perm_hd * (q / perm_rep) + perm_hd * perm_nk * (q % perm_rep);
++            }
++            const float value = __bfloat162float(x_token[source]);
++            values[r]         = __fmul_rn(value, signs_row[r * 32 + lane]);
++        }
++    }
++
++    normalized_hadamard_d1024_inplace(values, lane);
++
++    if (inverse) {
++#pragma unroll
++        for (int r = 0; r < 32; ++r) {
++            const float value = __fmul_rn(values[r], signs_row[r * 32 + lane]);
++            out_token[(block << 10) + r * 32 + lane] = __float2bfloat16_rn(value);
++        }
++    } else {
++#pragma unroll
++        for (int r = 0; r < 32; ++r) {
++            out_token[(block << 10) + r * 32 + lane] = __float2bfloat16_rn(values[r]);
++        }
++    }
++}
++
++// Inverse mapping of a freshly gathered embedding, in place, over the layout the embedding op
++// ACTUALLY writes.
++//
++// Every embed_gather_* kernel in this tree indexes `out + token * hidden + k` -- the output buffer
++// is TOKEN-major, even though the tensor's extents read [hidden, T]. Transforming it with the
++// [hidden, T] stride (k * T + t) would scramble every prefill: at T == 1 the two layouts coincide
++// exactly, so a decode-only test cannot see the difference, and a whole prefill window comes out
++// as noise (which reads as a perplexity close to uniform).
++//
++// Single pointer, so there is no restrict-aliasing contract to violate: each warp loads its 32
++// registers, transforms them, and writes the same 32 slots back.
++__global__ void ternary_rotate_inverse_inplace_bf16_kernel(__nv_bfloat16* __restrict__ data,
++                                                           const float* __restrict__ signs,
++                                                           int n_blk, int k, int tokens) {
++    const int lane   = threadIdx.x & (kThreadsPerWarp - 1);
++    const int warp   = static_cast<int>(blockIdx.x) * kWarpsPerBlock + (threadIdx.x >> 5);
++    const int blocks = k >> 10;
++    if (warp >= blocks * tokens) { return; }
++    const int block = warp % blocks;
++    const int token = warp / blocks;
++
++    const float* const signs_row = signs + (block % n_blk) * kBlockSize;
++    __nv_bfloat16* const base    = data + static_cast<std::int64_t>(token) * k;
++
++    float values[32];
++#pragma unroll
++    for (int r = 0; r < 32; ++r) {
++        values[r] = __bfloat162float(base[(block << 10) + r * 32 + lane]);
++    }
++
++    normalized_hadamard_d1024_inplace(values, lane);
++
++#pragma unroll
++    for (int r = 0; r < 32; ++r) {
++        const float value = __fmul_rn(values[r], signs_row[r * 32 + lane]);
++        base[(block << 10) + r * 32 + lane] = __float2bfloat16_rn(value);
++    }
++}
++
++} // namespace
++} // namespace ninfer::ops::detail
+--- a/src/ops/linear/ternary/ternary_row_view.h
++++ b/src/ops/linear/ternary/ternary_row_view.h
+@@ -0,0 +1,58 @@
++// MODIFIED for the NInfer ternary port (Ternary Bonsai 2 27B on NInfer / Ada sm_89).
++// This file differs from upstream NInfer; see patches/ in the release bundle
++// for the change list, rebuild steps and required verification.
++#pragma once
++
++#include "core/tensor.h"
++
++#include <cstddef>
++#include <cstdint>
++#include <stdexcept>
++
++namespace ninfer::ops::detail {
++
++// Row slice of a grouped row-split *ternary* parent (PTQ1_0_G128 / PQ2_0_G128).
++//
++// The fused families store one parent matrix that the graph splits into several logical
++// projections (the GDN value/z parent carries [value; z], the attention query/key parent carries
++// [query; key]). The binder's own row_view() slices the same planes the same way, so this mirrors
++// it exactly: the codes plane, then the high plane, then the scales plane, each laid out
++// row-major over [rows, groups].
++//
++// Plane geometry is per-format: PQ2_0 carries 32 code bytes per 128-weight group and no high
++// plane, PTQ1_0 carries 24 code bytes plus 2 high bytes. Assuming the Q4/Q5 32/0 split for PTQ1_0
++// would slice the wrong byte ranges, which produces plausible-looking garbage rather than an
++// error -- so the geometry is derived from qtype, never from a default.
++[[nodiscard]] inline Weight ternary_row_view(const Weight& block, std::int32_t row_begin,
++                                            std::int32_t row_count) {
++    const bool ptq1 = block.qtype == QType::PTQ1_0_G128;
++    if (!ptq1 && block.qtype != QType::PQ2_0_G128) {
++        throw std::invalid_argument("ternary row view: parent is not a ternary format");
++    }
++    if (block.layout != QuantLayout::RowSplit) {
++        throw std::invalid_argument("ternary row view: parent is not row-split");
++    }
++    if (block.group <= 0 || block.scales == nullptr || block.qdata == nullptr) {
++        throw std::invalid_argument("ternary row view: parent geometry is incomplete");
++    }
++    if (row_begin < 0 || row_count <= 0 || row_begin + row_count > block.n) {
++        throw std::invalid_argument("ternary row view: row range is out of bounds");
++    }
++    const std::uint64_t groups     = static_cast<std::uint64_t>(block.padded_shape[1] / block.group);
++    const std::uint64_t low_group  = ptq1 ? 24 : 32;
++    const std::uint64_t high_group = ptq1 ? 2 : 0;
++    Weight out                     = block;
++    out.qdata                      = static_cast<const std::byte*>(block.qdata) +
++                static_cast<std::uint64_t>(row_begin) * groups * low_group;
++    out.qhigh = high_group == 0 ? nullptr
++                                : static_cast<const std::byte*>(block.qhigh) +
++                                      static_cast<std::uint64_t>(row_begin) * groups * high_group;
++    out.scales = static_cast<const std::byte*>(block.scales) +
++                 static_cast<std::uint64_t>(row_begin) * groups * 2;
++    out.n               = row_count;
++    out.shape[0]        = row_count;
++    out.padded_shape[0] = row_count;
++    return out;
++}
++
++} // namespace ninfer::ops::detail
+--- a/src/ops/linear/ternary/ternary_rowsplit_gemm.cu
++++ b/src/ops/linear/ternary/ternary_rowsplit_gemm.cu
+@@ -0,0 +1,171 @@
++// MODIFIED for the NInfer ternary port (Ternary Bonsai 2 27B on NInfer / Ada sm_89).
++// This file differs from upstream NInfer; see patches/ in the release bundle
++// for the change list, rebuild steps and required verification.
++#include "ops/linear/ternary/ternary_rowsplit_gemm.cuh"
++
++#include "core/device.h"
++#include "ops/common/math.h"
++#include "ops/linear/ternary/ternary_launch.h"
++#include "ops/linear/ternary/ternary_rowsplit_gemv.cuh"
++#include "ops/linear/ternary/ternary_rowsplit_mma_small_t.cuh"
++
++#include <cstdint>
++#include <stdexcept>
++
++namespace ninfer::ops::detail {
++namespace {
++
++// Decode (T == 1) takes the warp-per-row GEMV for PQ2_0. K is a whole number of 128-groups for
++// every width in this model, so that kernel needs no column guard.
++void launch_pq2_gemv(const Tensor& x, const Weight& w, Tensor& out, cudaStream_t stream) {
++    if ((w.k % 128) != 0 || x.ne[1] != 1) {
++        throw std::invalid_argument("ternary gemv: expected one token and a whole-group K");
++    }
++    const std::int32_t groups_per_row = w.k / 128;
++    const unsigned grid               = static_cast<unsigned>(div_up(w.n, kGemvWarpsPerBlock));
++    ternary_pq2_gemv_kernel<<<grid, kGemvWarpsPerBlock * 32, 0, stream>>>(
++        static_cast<const __nv_bfloat16*>(x.data), static_cast<const std::uint8_t*>(w.qdata),
++        static_cast<const std::uint8_t*>(w.scales), static_cast<__nv_bfloat16*>(out.data), w.n,
++        groups_per_row);
++    CUDA_CHECK(cudaGetLastError());
++}
++
++// Small-token-tile GEMV: weights are read once for up to 4 tokens, which is what makes the
++// speculative verify pass (T = draft + 1) cheap. Falls back to the reference tiled kernel beyond
++// that, and for PTQ1_0 / padded-K weights.
++void launch_pq2_gemv_tile(const Tensor& x, const Weight& w, Tensor& out,
++                          std::int32_t out_row_stride, std::int32_t tokens,
++                          cudaStream_t stream) {
++    if ((w.k % 128) != 0) {
++        throw std::invalid_argument("ternary gemv: K must be a whole number of 128-groups");
++    }
++    const std::int32_t groups_per_row = w.k / 128;
++    const unsigned grid               = static_cast<unsigned>(div_up(w.n, kGemvWarpsPerBlock));
++    const dim3 block(kGemvWarpsPerBlock * 32, 1u, 1u);
++    if (tokens <= 1) {
++        ternary_pq2_gemv_kernel<<<grid, block, 0, stream>>>(
++            static_cast<const __nv_bfloat16*>(x.data), static_cast<const std::uint8_t*>(w.qdata),
++            static_cast<const std::uint8_t*>(w.scales), static_cast<__nv_bfloat16*>(out.data), w.n,
++            groups_per_row);
++    } else {
++        ternary_pq2_gemv_tile_kernel<4><<<grid, block, 0, stream>>>(
++            static_cast<const __nv_bfloat16*>(x.data), static_cast<const std::uint8_t*>(w.qdata),
++            static_cast<const std::uint8_t*>(w.scales), static_cast<__nv_bfloat16*>(out.data), w.n,
++            groups_per_row, tokens, out_row_stride);
++    }
++    CUDA_CHECK(cudaGetLastError());
++}
++
++template <class Storage, class Atom, int kTileT>
++void launch_gemm(const Tensor& x, const Weight& w, Tensor& out, std::int32_t out_row_stride,
++                 cudaStream_t stream) {
++    const std::int32_t rows = w.n;
++    const std::int32_t k    = w.k;
++    const std::int32_t t    = x.ne[1];
++    if (k % Storage::kGroupK != 0) {
++        throw std::invalid_argument("ternary linear: K must be a multiple of the group size");
++    }
++    if (out_row_stride < rows) {
++        throw std::invalid_argument("ternary linear: output row stride is smaller than the tile");
++    }
++    const std::int32_t groups_per_row = k / Storage::kGroupK;
++
++    const dim3 grid(static_cast<unsigned>(rows), static_cast<unsigned>(div_up(t, kTileT)), 1u);
++    constexpr dim3 block(Storage::kGroupK, 1u, 1u);
++
++    ternary_rowsplit_gemm_kernel<Storage, Atom, kTileT><<<grid, block, 0, stream>>>(
++        static_cast<const __nv_bfloat16*>(x.data), static_cast<const std::uint8_t*>(w.qdata),
++        static_cast<const std::uint8_t*>(w.qhigh), static_cast<const std::uint8_t*>(w.scales),
++        static_cast<__nv_bfloat16*>(out.data), rows, k, t, groups_per_row, out_row_stride);
++    CUDA_CHECK(cudaGetLastError());
++}
++
++template <int kTileT>
++void launch_by_qtype(const Tensor& x, const Weight& w, Tensor& out, std::int32_t out_row_stride,
++                     cudaStream_t stream) {
++    switch (w.qtype) {
++    case QType::PTQ1_0_G128:
++        launch_gemm<PTQ1RowSplitStorage, PTQ1SimtDecodeAtom, kTileT>(x, w, out, out_row_stride,
++                                                                    stream);
++        return;
++    case QType::PQ2_0_G128:
++        launch_gemm<PQ2RowSplitStorage, PQ2SimtDecodeAtom, kTileT>(x, w, out, out_row_stride,
++                                                                  stream);
++        return;
++    default:
++        break;
++    }
++    throw std::invalid_argument("ternary linear: unsupported weight qtype");
++}
++
++} // namespace
++
++// A PQ2_0 weight can take the GEMV family whenever the layout did not pad K past the real width --
++// true for every width in this model (5120/6144/10240/17408 are all whole 128-groups), and checked
++// here rather than assumed, because the GEMV reads whole groups without a column guard.
++bool gemv_admits(const Tensor& x, const Weight& w, std::int32_t max_tokens) {
++    return w.qtype == QType::PQ2_0_G128 && w.qhigh == nullptr && w.padded_shape[1] == w.k &&
++           (w.k % 128) == 0 && x.ne[1] >= 1 && x.ne[1] <= max_tokens;
++}
++
++void launch_ternary_gemm_t1(const Tensor& x, const Weight& w, Tensor& out,
++                            std::int32_t out_row_stride, cudaStream_t stream) {
++    if (gemv_admits(x, w, 1)) {
++        launch_pq2_gemv_tile(x, w, out, out_row_stride, x.ne[1], stream);
++        return;
++    }
++    launch_by_qtype<1>(x, w, out, out_row_stride, stream);
++}
++
++// ---------------------------------------------------------------------------
++// Ternary PQ2_0 tensor-core path for the small-T regime (T = 2..8), implemented in
++// ternary_rowsplit_mma_small_t.cuh. This is the batch fast path.
++//
++// The SIMT tile GEMV above reuses each weight across its tile but still pays one FMA per weight
++// PER TOKEN, so its cost grows with T while its weight traffic does not: measured on a 322 MB
++// PQ2_0 payload it takes 0.706 ms at T = 1 and 1.533 ms at T = 3, i.e. 2.2x the time for
++// byte-identical traffic (211 GiB/s against 483 GiB/s). One mma.m16n8k16 carries 16 rows x 8
++// tokens x 16 k, so every token in the tile rides the same weight read at no extra instruction
++// cost.
++//
++// T >= 2 only: the T = 1 endpoint of that same measurement (0.603 against 0.706 ms) did NOT
++// transfer to the real engine -- see the note on launch_ternary_gemm_t1 -- so decode stays on
++// the GEMV. Selected inside launch_ternary_gemm_t8; roll back with NINFER_TERNARY_MMA=0.
++// ---------------------------------------------------------------------------
++bool mma_admits(const Weight& w, std::int32_t out_row_stride) {
++    return w.qtype == QType::PQ2_0_G128 && w.qhigh == nullptr && w.padded_shape[1] == w.k &&
++           (w.k % kTernaryMmaChunkK) == 0 && out_row_stride >= w.n;
++}
++
++void launch_pq2_mma_small_t(const Tensor& x, const Weight& w, Tensor& out,
++                            std::int32_t out_row_stride, std::int32_t tokens,
++                            cudaStream_t stream) {
++    // The staging is static shared memory (a compile-time 32 KB), so there is no dynamic size to
++    // pass and no cudaFuncSetAttribute opt-in to make -- which is also what keeps it legal inside
++    // the captured CUDA graphs this op runs in.
++    const unsigned grid = static_cast<unsigned>(div_up(w.n, kTernaryMmaRowsPerCta));
++    ternary_pq2_mma_small_t_kernel<<<grid, kTernaryMmaThreads, 0, stream>>>(
++        static_cast<const __nv_bfloat16*>(x.data), static_cast<const std::uint8_t*>(w.qdata),
++        static_cast<const std::uint8_t*>(w.scales), static_cast<__nv_bfloat16*>(out.data), w.n,
++        w.k, tokens, out_row_stride);
++    CUDA_CHECK(cudaGetLastError());
++}
++
++void launch_ternary_gemm_t8(const Tensor& x, const Weight& w, Tensor& out,
++                            std::int32_t out_row_stride, cudaStream_t stream) {
++    // The speculative verify pass runs T = draft + 1 (2..4 here). Prefill arrives with T >= 128
++    // and is carried by the same kernel, at ceil(T/8) weight passes. The reference tiled kernel
++    // wastes five of its eight token slots at verify size and needs a 128-thread CTA plus seven
++    // barriers per output row, which cost more than the whole decode step it was verifying.
++    if (ternary_mma_enabled() && mma_admits(w, out_row_stride) && x.ne[1] >= 2) {
++        launch_pq2_mma_small_t(x, w, out, out_row_stride, x.ne[1], stream);
++        return;
++    }
++    if (gemv_admits(x, w, 4)) {
++        launch_pq2_gemv_tile(x, w, out, out_row_stride, x.ne[1], stream);
++        return;
++    }
++    launch_by_qtype<8>(x, w, out, out_row_stride, stream);
++}
++
++} // namespace ninfer::ops::detail
+--- a/src/ops/linear/ternary/ternary_rowsplit_gemm.cuh
++++ b/src/ops/linear/ternary/ternary_rowsplit_gemm.cuh
+@@ -0,0 +1,115 @@
++// MODIFIED for the NInfer ternary port (Ternary Bonsai 2 27B on NInfer / Ada sm_89).
++// This file differs from upstream NInfer; see patches/ in the release bundle
++// for the change list, rebuild steps and required verification.
++#pragma once
++
++#include "ops/linear/ternary/ternary_rowsplit_storage.cuh"
++
++#include <cuda_bf16.h>
++#include <cuda_runtime.h>
++
++#include <cstdint>
++
++namespace ninfer::ops::detail {
++
++// The decode-shaped GEMV that replaces the reference kernel at T == 1 lives in
++// ternary_rowsplit_gemv.cuh. It is deliberately NOT included here yet: the CUDA 13.3 cudafe++
++// front end dies (0xC0000409) on that kernel in this translation unit, so it stays out of the built
++// header until the construct is pinned down.
++
++// Correctness-first reference path for the ternary row-split formats.
++//
++// One CTA owns one output row and a tile of kTileT tokens. The CTA has exactly kGroupK
++// (128) threads, so thread `index` owns weight `index` inside every 128-weight group:
++// a group is decoded once by the whole CTA and reused across the whole token tile, which
++// is what keeps this from being 128x redundant. This is the "dequantize the block and
++// accumulate in F32" shape that upstream's reference kernel uses; a repack/SIMT fast path is
++// still deliberately left out. The MMA path for the small-T regime (T = 2..8) -- which also
++// carries prefill, at ceil(T/8) weight passes -- now ships as ternary_rowsplit_mma_small_t.cuh
++// and is selected inside launch_ternary_gemm_t8 (roll back with NINFER_TERNARY_MMA=0).
++//
++// Activation layout is [K, T] with ne[0] = K CONTIGUOUS, i.e. the ninfer/ggml convention: element
++// (column, token) lives at token * k + column. Output is [N, T] the same way: (row, token) at
++// token * rows + row. Treating either as row-major ([K, T] with k*T + t) scrambles every prefill
++// while T == 1 still works, because the two layouts coincide exactly at one token.
++template <class Storage, class Atom, int kTileT>
++__global__ __launch_bounds__(Storage::kGroupK)
++void ternary_rowsplit_gemm_kernel(const __nv_bfloat16* __restrict__ x,
++                                  const std::uint8_t* __restrict__ codes,
++                                  const std::uint8_t* __restrict__ high,
++                                  const std::uint8_t* __restrict__ scales,
++                                  __nv_bfloat16* __restrict__ out, std::int32_t rows,
++                                  std::int32_t k, std::int32_t t, std::int32_t groups_per_row,
++                                  std::int32_t out_row_stride) {
++    static_assert(kTileT >= 1, "the ternary GEMM needs a positive token tile");
++    constexpr int kThreads = Storage::kGroupK;
++
++    const int row = static_cast<int>(blockIdx.x);
++    if (row >= rows) { return; }
++    const int t0 = static_cast<int>(blockIdx.y) * kTileT;
++
++    // Planes are laid out row-major over [rows, groups_per_row].
++    const std::uint8_t* code_row =
++        codes + static_cast<std::int64_t>(row) * groups_per_row * Storage::kCodeBytesPerGroup;
++    const std::uint8_t* high_row =
++        high == nullptr ? nullptr
++                        : high + static_cast<std::int64_t>(row) * groups_per_row *
++                                     Storage::kHighBytesPerGroup;
++    const std::uint8_t* scale_row =
++        scales + static_cast<std::int64_t>(row) * groups_per_row * Storage::kScaleBytesPerGroup;
++
++    const int index = static_cast<int>(threadIdx.x);
++
++    float accumulator[kTileT];
++#pragma unroll
++    for (int i = 0; i < kTileT; ++i) { accumulator[i] = 0.0f; }
++
++    for (int group = 0; group < groups_per_row; ++group) {
++        const std::uint8_t* group_codes = code_row + group * Storage::kCodeBytesPerGroup;
++        const std::uint8_t* group_high =
++            high_row == nullptr ? nullptr : high_row + group * Storage::kHighBytesPerGroup;
++        const float scale = Atom::load_scale(scale_row + group * Storage::kScaleBytesPerGroup);
++        const float weight = Atom::decode_one(group_codes, group_high, scale, index);
++
++        const std::int32_t column = group * Storage::kGroupK + index;
++        if (column < k) {
++#pragma unroll
++            for (int i = 0; i < kTileT; ++i) {
++                const std::int32_t token = t0 + i;
++                if (token < t) {
++                    accumulator[i] += weight *
++                        __bfloat162float(x[static_cast<std::int64_t>(token) * k + column]);
++                }
++            }
++        }
++    }
++
++    __shared__ float partials[kTileT][kThreads];
++#pragma unroll
++    for (int i = 0; i < kTileT; ++i) { partials[i][index] = accumulator[i]; }
++    __syncthreads();
++
++    // Tree reduction over the CTA; every stage halves the active thread range.
++    for (int stride = kThreads / 2; stride > 0; stride >>= 1) {
++        if (index < stride) {
++#pragma unroll
++            for (int i = 0; i < kTileT; ++i) { partials[i][index] += partials[i][index + stride]; }
++        }
++        __syncthreads();
++    }
++
++    if (index == 0) {
++#pragma unroll
++        for (int i = 0; i < kTileT; ++i) {
++            const std::int32_t token = t0 + i;
++            if (token < t) {
++                // out_row_stride is the PARENT's row count, so several projections can write
++                // disjoint row ranges of one fused output (the GDN split parent, for instance).
++                out[static_cast<std::int64_t>(token) * out_row_stride + row] =
++                    __float2bfloat16_rn(partials[i][0]);
++            }
++        }
++    }
++}
++
++} // namespace ninfer::ops::detail
+--- a/src/ops/linear/ternary/ternary_rowsplit_gemv.cuh
++++ b/src/ops/linear/ternary/ternary_rowsplit_gemv.cuh
+@@ -0,0 +1,164 @@
++// MODIFIED for the NInfer ternary port (Ternary Bonsai 2 27B on NInfer / Ada sm_89).
++// This file differs from upstream NInfer; see patches/ in the release bundle
++// for the change list, rebuild steps and required verification.
++#pragma once
++
++// Decode-shaped ternary GEMV (T == 1) for PQ2_0: one warp owns one output row.
++//
++// Why: the reference kernel in ternary_rowsplit_gemm.cuh gives each output row a full 128-thread
++// CTA and seven block-wide barriers. That is fine for correctness but leaves decode far from the
++// card's measured bandwidth. Here each lane covers four consecutive weights of every 128-group, so
++// a warp reads exactly one 32-byte code span plus one 2-byte scale per group and reduces through
++// shuffles with no __syncthreads at all.
++//
++// PQ2_0 packing makes the mapping exact rather than approximate: a group is 32 bytes holding four
++// two-bit codes each, so for lane l the four columns 4l..4l+3 live entirely in byte l. Lane l
++// loads one byte, decodes four weights, and consumes four bf16 activations.
++//
++// Occupancy, not instruction count, is what this kernel is tuned for: a GEMV needs many warps in
++// flight to cover DRAM latency. A two-rows-per-warp variant (which reuses the activation loads)
++// measured SLOWER (32.8 vs 46.4 t/s) because the extra accumulators and row bases cost registers
++// and dropped the resident warp count. So: one row per warp, and only the micro-optimisations that
++// remove instructions without adding state -- one 16-bit scale load, paired bf16 activation
++// loads, and the per-group scale multiply hoisted out of the four FMAs.
++//
++// LAYOUT: ninfer/ggml put ne[0] on the contiguous axis, so a [k, 1] activation keeps element
++// (column, 0) at column, and a one-token output row is simply out[row].
++
++#include <cuda_bf16.h>
++#include <cuda_fp16.h>
++#include <cuda_runtime.h>
++
++#include <cstdint>
++
++namespace ninfer::ops::detail {
++
++// Warps per block for the GEMV below.
++inline constexpr int kGemvWarpsPerBlock = 8;
++
++inline constexpr int kGemvCodeBytesPerGroup  = 32;
++inline constexpr int kGemvScaleBytesPerGroup = 2;
++inline constexpr int kGemvGroupK             = 128;
++
++__device__ __forceinline__ float gemv_scale(const std::uint8_t* scale_ptr) {
++    // One 16-bit load instead of two byte loads plus a shift/or; the scale plane is 2-byte aligned.
++    const std::uint16_t bits = *reinterpret_cast<const std::uint16_t*>(scale_ptr);
++    return __half2float(__ushort_as_half(bits));
++}
++
++__global__ __launch_bounds__(kGemvWarpsPerBlock * 32)
++void ternary_pq2_gemv_kernel(const __nv_bfloat16* __restrict__ x,
++                             const std::uint8_t* __restrict__ codes,
++                             const std::uint8_t* __restrict__ scales,
++                             __nv_bfloat16* __restrict__ out, std::int32_t rows,
++                             std::int32_t groups_per_row) {
++    const int lane = static_cast<int>(threadIdx.x) & 31;
++    const int warp =
++        static_cast<int>(blockIdx.x) * kGemvWarpsPerBlock + (static_cast<int>(threadIdx.x) >> 5);
++    if (warp >= rows) { return; }
++
++    const std::uint8_t* code_row =
++        codes + static_cast<std::int64_t>(warp) * groups_per_row * kGemvCodeBytesPerGroup;
++    const std::uint8_t* scale_row =
++        scales + static_cast<std::int64_t>(warp) * groups_per_row * kGemvScaleBytesPerGroup;
++
++    float accumulator = 0.0f;
++
++    for (int group = 0; group < groups_per_row; ++group) {
++        const std::int32_t base = group * kGemvGroupK + lane * 4;
++        const float2 low        = __bfloat1622float2(
++            *reinterpret_cast<const __nv_bfloat162*>(x + base));
++        const float2 high = __bfloat1622float2(
++            *reinterpret_cast<const __nv_bfloat162*>(x + base + 2));
++
++        const std::uint8_t raw = code_row[group * kGemvCodeBytesPerGroup + lane];
++        const float dot = fmaf(static_cast<float>(static_cast<int>(raw & 3u) - 1), low.x,
++                               fmaf(static_cast<float>(static_cast<int>((raw >> 2) & 3u) - 1),
++                                    low.y,
++                                    fmaf(static_cast<float>(static_cast<int>((raw >> 4) & 3u) - 1),
++                                         high.x,
++                                         static_cast<float>(static_cast<int>((raw >> 6) & 3u) - 1) *
++                                             high.y)));
++        accumulator = fmaf(gemv_scale(scale_row + group * kGemvScaleBytesPerGroup), dot,
++                           accumulator);
++    }
++
++#pragma unroll
++    for (int offset = 16; offset > 0; offset >>= 1) {
++        accumulator += __shfl_down_sync(0xffffffffu, accumulator, offset);
++    }
++    if (lane == 0) { out[warp] = __float2bfloat16_rn(accumulator); }
++}
++
++// Small-token-tile variant, for the speculative VERIFY pass (T = draft + 1, i.e. 2..4).
++//
++// A per-token GEMV would re-read every weight for every token, and weights are exactly what the
++// decode path is bound by, so a verify round would cost T full decode passes and speculation could
++// never pay for itself (measured: 15.7 t/s with MTP N=2 against 62.1 t/s without). This kernel
++// keeps the weights single-read: the code byte and scale are loaded once per group and reused for
++// all kT tokens, while each token contributes its own four activations.
++template <int kT>
++__global__ __launch_bounds__(kGemvWarpsPerBlock * 32)
++void ternary_pq2_gemv_tile_kernel(const __nv_bfloat16* __restrict__ x,
++                                  const std::uint8_t* __restrict__ codes,
++                                  const std::uint8_t* __restrict__ scales,
++                                  __nv_bfloat16* __restrict__ out, std::int32_t rows,
++                                  std::int32_t groups_per_row, std::int32_t tokens,
++                                  std::int32_t out_row_stride) {
++    static_assert(kT >= 1 && kT <= 8, "tile size must be small enough to keep accumulators in registers");
++    const int lane = static_cast<int>(threadIdx.x) & 31;
++    const int warp =
++        static_cast<int>(blockIdx.x) * kGemvWarpsPerBlock + (static_cast<int>(threadIdx.x) >> 5);
++    if (warp >= rows) { return; }
++
++    const std::uint8_t* code_row =
++        codes + static_cast<std::int64_t>(warp) * groups_per_row * kGemvCodeBytesPerGroup;
++    const std::uint8_t* scale_row =
++        scales + static_cast<std::int64_t>(warp) * groups_per_row * kGemvScaleBytesPerGroup;
++
++    float accumulator[kT];
++#pragma unroll
++    for (int t = 0; t < kT; ++t) { accumulator[t] = 0.0f; }
++
++    for (int group = 0; group < groups_per_row; ++group) {
++        // Weights: one byte of codes + one 16-bit scale, reused across every token in the tile.
++        const std::uint8_t raw = code_row[group * kGemvCodeBytesPerGroup + lane];
++        const float scale = gemv_scale(scale_row + group * kGemvScaleBytesPerGroup);
++        const float weight0 = static_cast<float>(static_cast<int>(raw & 3u) - 1);
++        const float weight1 = static_cast<float>(static_cast<int>((raw >> 2) & 3u) - 1);
++        const float weight2 = static_cast<float>(static_cast<int>((raw >> 4) & 3u) - 1);
++        const float weight3 = static_cast<float>(static_cast<int>((raw >> 6) & 3u) - 1);
++
++        const std::int32_t base = group * kGemvGroupK + lane * 4;
++#pragma unroll
++        for (int t = 0; t < kT; ++t) {
++            if (t < tokens) {
++                const __nv_bfloat16* x_token =
++                    x + static_cast<std::int64_t>(t) * groups_per_row * kGemvGroupK;
++                const float2 low = __bfloat1622float2(
++                    *reinterpret_cast<const __nv_bfloat162*>(x_token + base));
++                const float2 high = __bfloat1622float2(
++                    *reinterpret_cast<const __nv_bfloat162*>(x_token + base + 2));
++                const float dot = fmaf(weight0, low.x,
++                                       fmaf(weight1, low.y, fmaf(weight2, high.x, weight3 * high.y)));
++                accumulator[t] = fmaf(scale, dot, accumulator[t]);
++            }
++        }
++    }
++
++#pragma unroll
++    for (int t = 0; t < kT; ++t) {
++        float value = accumulator[t];
++#pragma unroll
++        for (int offset = 16; offset > 0; offset >>= 1) {
++            value += __shfl_down_sync(0xffffffffu, value, offset);
++        }
++        if (lane == 0 && t < tokens) {
++            // Token-major output: element (row, token) lives at token * out_row_stride + row.
++            out[static_cast<std::int64_t>(t) * out_row_stride + warp] =
++                __float2bfloat16_rn(value);
++        }
++    }
++}
++
++} // namespace ninfer::ops::detail
+--- a/src/ops/linear/ternary/ternary_rowsplit_mma_small_t.cuh
++++ b/src/ops/linear/ternary/ternary_rowsplit_mma_small_t.cuh
+@@ -0,0 +1,373 @@
++// PART OF the NInfer ternary port (Ternary Bonsai 2 27B on NInfer / Ada sm_89).
++// NEW file, not present upstream; see patches/ in the release bundle for the change list,
++// rebuild steps and required verification. Roll back with NINFER_TERNARY_MMA=0.
++#pragma once
++
++// Ternary PQ2_0 tensor-core path for the small-T regime (T = 2..8) -- which is exactly the
++// speculative VERIFY pass, T = draft + 1.
++//
++// WHY THIS EXISTS (measured, not assumed)
++// The SIMT tile GEMV is INSTRUCTION-ISSUE bound at T > 1, not bandwidth bound. Its register
++// footprint is 36 (tile<4>) against 40 for the T=1 GEMV, so occupancy is NOT the constraint --
++// the handover's "extra accumulators cost registers and dropped the resident warp count" story
++// does not hold. What actually scales with T is work per weight: one FMA per weight PER TOKEN,
++// plus two activation loads and a bf16->f32 convert per token. Measured on a synthetic PQ2_0
++// payload at N=248320, K=5120:
++//
++//     T=1   gemv      0.652 ms   483 GiB/s     (the plain warp-per-row GEMV)
++//     T=3   gemv_tile 1.493 ms   211 GiB/s     (2.29x the T=1 time, identical weight bytes)
++//     T=3   reference 5.402 ms    60 GiB/s     (amortises well but 8x slower in absolute terms)
++//
++// So the tile GEMV does reuse each weight across the tile, but pays a per-token instruction bill
++// that eats the entire gain. The tensor core removes that bill: one mma.m16n8k16 covers
++// 16 rows x 8 tokens x 16 k in ONE instruction, so every token in the tile rides the same weight
++// read at zero extra instruction cost. Weights are decoded once per (row, k-byte) through a
++// 256-entry shared LUT, which turns "one packed byte -> four ternary weights" into one LDS.64.
++//
++// LAYOUT NOTES THAT ARE LOAD-BEARING (violate them and T == 1 still looks perfect):
++//   * ninfer/ggml keep ne[0] contiguous, so an activation with ne=(k,T) is TOKEN-major: element
++//     (column, token) lives at token*k + column. The mma B operand wants n rows of k with k
++//     contiguous, so the activation tile is staged verbatim, with no transpose.
++//   * the output is token-major as well: (row, token) at token*out_row_stride + row.
++//   * PQ2_0 packs FOUR 2-bit codes per byte, and code c denotes weight value (c - 1). The group
++//     scale is applied AFTER the mma, per row, because one group spans 8 mma k-steps.
++//
++// GEOMETRY: one warp owns 16 output rows and walks the whole K; the CTA is 8 warps, so a CTA
++// covers 128 rows. Warps never cooperate, so there is no cross-warp reduction and no barrier
++// beyond the shared staging handshake. K is consumed in 256-wide chunks (two PQ2_0 groups),
++// double buffered with cp.async so the weight stream is not serialised behind the mma.
++
++#include "ops/common/mma.cuh"
++#include "ops/common/memory.cuh"
++#include "ops/linear/ternary/ternary_rowsplit_storage.cuh"
++
++#include <cuda_bf16.h>
++#include <cuda_runtime.h>
++
++#include <cstdint>
++#include <cstdlib>
++#include <string>
++
++namespace ninfer::ops::detail {
++
++inline constexpr int kTernaryMmaRowsPerWarp     = 16;
++inline constexpr int kTernaryMmaTokens          = 8;
++// Warps (and therefore rows) per CTA. This is the knob that decides how many CTAs a narrow
++// projection launches: a PQ2_0 weight is tiled 16 rows per warp, so with 8 warps a N=5120 projection
++// gets only 40 CTAs and leaves half of this card's 80 SMs idle, measuring 322 GiB/s instead of the
++// 618 GiB/s the same kernel reaches on the 272-CTA MLP shape. Four warps doubles the CTA count
++// (N=5120 -> 80 CTAs, one per SM) at the cost of fewer resident warps per SM, which the cp.async
++// pipeline is there to absorb.
++inline constexpr int kTernaryMmaWarpsPerCta     = 4;
++inline constexpr int kTernaryMmaRowsPerCta      = kTernaryMmaRowsPerWarp * kTernaryMmaWarpsPerCta;
++inline constexpr int kTernaryMmaGroupK          = PQ2RowSplitStorage::kGroupK;
++// K consumed per staged chunk. Doubling this from 256 to 512 halves both the number of
++// __syncthreads pairs (two per chunk) and the number of times each CTA re-stages its activation
++// tile -- the two overheads that keep this kernel at ~400 GiB/s against the ~540 GiB/s the T=1
++// GEMV reaches on the same weights. The cost is more shared memory per CTA, so it is an empirical
++// question, not an obvious win.
++inline constexpr int kTernaryMmaChunkK          = 512;
++inline constexpr int kTernaryMmaGroupsPerChunk  = kTernaryMmaChunkK / kTernaryMmaGroupK;
++inline constexpr int kTernaryMmaKStepsPerChunk  = kTernaryMmaChunkK / 16;
++inline constexpr int kTernaryMmaCodesPerRow     = kTernaryMmaChunkK / 4; // four codes per byte
++inline constexpr int kTernaryMmaRowStride       = 144;                   // 128 used + pad
++inline constexpr int kTernaryMmaActStride       = kTernaryMmaChunkK + 8; // 16B-aligned, padded
++inline constexpr int kTernaryMmaStages          = 2;
++inline constexpr int kTernaryMmaThreads         = kTernaryMmaWarpsPerCta * 32;
++
++static_assert((kTernaryMmaRowStride % 16) == 0, "cp.async needs a 16-byte aligned row start");
++static_assert(kTernaryMmaRowStride >= kTernaryMmaCodesPerRow, "the row must hold a whole chunk");
++static_assert((kTernaryMmaActStride % 8) == 0, "ldmatrix wants 8-element row starts");
++static_assert((kTernaryMmaChunkK % kTernaryMmaGroupK) == 0, "chunks must be whole groups");
++static_assert((kTernaryMmaChunkK % 16) == 0, "chunks must be whole mma k-steps");
++
++union TernaryMmaPairBits {
++    __nv_bfloat162 pair;
++    unsigned bits;
++};
++
++// NINFER_TERNARY_MMA=0 forces the SIMT paths, which is the A/B switch for validating this kernel
++// end to end on the real artifact.
++//
++// It is needed because the perplexity harness runs with --context 512, i.e. T = 512, which is far
++// outside this kernel's 2..8 token window and therefore falls through to the reference kernel. A
++// perplexity run with a window inside 2..8 IS covered here, so comparing the two values with the
++// switch on and off is a direct numeric equivalence test of the tensor-core path on real weights
++// rather than on a synthetic payload.
++//
++// Read once: the choice decides whether a kernel appears in the captured CUDA graph at all, so it
++// must not change between graph construction and replay (same rule as the rotation switch).
++[[nodiscard]] inline bool ternary_mma_enabled() {
++    static const bool enabled = [] {
++        const char* value = std::getenv("NINFER_TERNARY_MMA");
++        return value == nullptr || std::string(value) != "0";
++    }();
++    return enabled;
++}
++
++// Shared staging. The row strides are chosen so that the shared accesses in the hot loop are
++// bank-conflict free, which is why they are not just the natural 64 / 256:
++//   * codes: a whole k-step is one 4-byte word, and the four lanes of a quad read the SAME word,
++//     so the only conflicts are between rows. With a 64-byte row stride the word offset is
++//     16*row + kstep and rows collapse onto two banks; 80 bytes gives 20*row + kstep, whose
++//     low five bits are distinct across the eight rows a single load touches.
++//   * activations: ldmatrix pulls 16 bytes per row, so rows must start on distinct banks.
++//     528 bytes = 132 words => 4 banks apart, which lands rows 0..7 on banks 0,4,...,28 exactly.
++struct TernaryMmaStorage {
++    uint2 lut[256];
++    alignas(16) std::uint8_t codes[kTernaryMmaStages][kTernaryMmaWarpsPerCta]
++                                  [kTernaryMmaRowsPerWarp][kTernaryMmaRowStride];
++    alignas(16) __nv_bfloat16 act[kTernaryMmaStages][kTernaryMmaTokens][kTernaryMmaActStride];
++    std::uint16_t scales[kTernaryMmaStages][kTernaryMmaWarpsPerCta][kTernaryMmaRowsPerWarp]
++                        [kTernaryMmaGroupsPerChunk];
++};
++
++__global__ __launch_bounds__(kTernaryMmaThreads)
++void ternary_pq2_mma_small_t_kernel(const __nv_bfloat16* __restrict__ x,
++                                    const std::uint8_t* __restrict__ codes,
++                                    const std::uint8_t* __restrict__ scales,
++                                    __nv_bfloat16* __restrict__ out, std::int32_t rows,
++                                    std::int32_t k, std::int32_t tokens,
++                                    std::int32_t out_row_stride) {
++    // STATIC shared memory, deliberately not `extern __shared__`: the footprint is a compile-time
++    // constant (32 KB, under the 48 KB per-block static cap), and declaring an extern shared
++    // VARIABLE OF A NAMED AGGREGATE type emits a device symbol that nvlink then cannot resolve
++    // ("nvlink error : Undefined reference to 'ninfer::ops::detail::shared'"). Static also removes
++    // the need for a cudaFuncSetAttribute opt-in and for a size at every launch site.
++    __shared__ TernaryMmaStorage staging;
++    auto& lut      = staging.lut;
++    auto& codes_sh = staging.codes;
++    auto& act_sh   = staging.act;
++    auto& scale_sh = staging.scales;
++
++    const int tid  = static_cast<int>(threadIdx.x);
++    const int warp = tid >> 5;
++    const int lane = tid & 31;
++    const int gid  = lane >> 2; // 0..7  -- mma row within the fragment
++    const int lid  = lane & 3;  // 0..3  -- mma k pair / column pair index
++
++    // ---- decode table: packed byte -> four ternary weights in bf16 ----------------------------
++    // Every code c means value (c - 1), so the table holds exact signed integers and the multiply
++    // is exact (no rounding: +-1 scaling in bf16 is a pure exponent/sign change).
++    for (int i = tid; i < 256; i += kTernaryMmaThreads) {
++        TernaryMmaPairBits low;
++        TernaryMmaPairBits high;
++        low.pair  = __floats2bfloat162_rn(static_cast<float>((i & 3) - 1),
++                                         static_cast<float>(((i >> 2) & 3) - 1));
++        high.pair = __floats2bfloat162_rn(static_cast<float>(((i >> 4) & 3) - 1),
++                                          static_cast<float>(((i >> 6) & 3) - 1));
++        uint2 entry;
++        entry.x = low.bits;
++        entry.y = high.bits;
++        lut[i]  = entry;
++    }
++
++    const int row0 = static_cast<int>(blockIdx.x) * kTernaryMmaRowsPerCta;
++    if (row0 >= rows) { return; }
++
++    const std::int32_t groups_per_row = k / kTernaryMmaGroupK;
++    const std::int64_t code_row_bytes =
++        static_cast<std::int64_t>(groups_per_row) * PQ2RowSplitStorage::kCodeBytesPerGroup;
++    const std::int64_t scale_row_bytes =
++        static_cast<std::int64_t>(groups_per_row) * PQ2RowSplitStorage::kScaleBytesPerGroup;
++    const std::int32_t chunks = k / kTernaryMmaChunkK;
++
++    const std::int64_t warp_row_base =
++        static_cast<std::int64_t>(row0) + static_cast<std::int64_t>(warp) * kTernaryMmaRowsPerWarp;
++
++    // Stage one chunk: this warp's 16x64 code window, its scales, and (cooperatively) the
++    // CTA-wide activation tile. Out-of-range rows are zero-filled rather than read, so a partial
++    // CTA never touches global memory past the end of the weight.
++    //
++    // `tok_base` selects which tile of kTernaryMmaTokens tokens this staging is for. A CTA walks
++    // the whole sequence in such tiles, which is what lets one kernel serve both the 2..8 token
++    // speculative verify pass and a full prefill, instead of falling back to the reference kernel
++    // above 8 tokens -- the fallback that made prefill measure 55 tok/s against 412-437 for the
++    // non-ternary engine.
++    const auto stage = [&](int buf, int chunk, int tok_base) {
++        const std::int64_t chunk_byte =
++            static_cast<std::int64_t>(chunk) * kTernaryMmaCodesPerRow;
++        const std::int64_t chunk_k = static_cast<std::int64_t>(chunk) * kTernaryMmaChunkK;
++
++        // Codes: kTernaryMmaCodesPerRow bytes per row, moved as 16-byte copies filled round-robin
++        // across the lanes. Written generically on purpose -- sizing this loop by hand for one
++        // chunk width silently stages only PART of each row at another width, which presents as a
++        // suspiciously fast kernel that produces garbage (all four correctness checks went to NaN).
++        constexpr int kCopiesPerRow  = kTernaryMmaCodesPerRow / 16;
++        constexpr int kCopiesPerWarp = kTernaryMmaRowsPerWarp * kCopiesPerRow;
++#pragma unroll
++        for (int copy = lane; copy < kCopiesPerWarp; copy += 32) {
++            const int local_row           = copy / kCopiesPerRow;
++            const int byte_off            = (copy % kCopiesPerRow) * 16;
++            const std::int64_t global_row = warp_row_base + local_row;
++            std::uint8_t* dst             = &codes_sh[buf][warp][local_row][byte_off];
++            if (global_row < rows) {
++                cp_async<16, Cache::cg>(
++                    dst, codes + global_row * code_row_bytes + chunk_byte + byte_off);
++            } else {
++                store_vec<std::uint8_t, uint4>(dst, make_uint4(0u, 0u, 0u, 0u));
++            }
++        }
++
++        { // scales: one entry per (row, group-in-chunk) -- 16 x 4 at a 512-wide chunk
++            constexpr int kScaleEntries = kTernaryMmaRowsPerWarp * kTernaryMmaGroupsPerChunk;
++#pragma unroll
++            for (int entry = lane; entry < kScaleEntries; entry += 32) {
++                const int local_row           = entry / kTernaryMmaGroupsPerChunk;
++                const int group_in_chunk      = entry % kTernaryMmaGroupsPerChunk;
++                const std::int64_t global_row = warp_row_base + local_row;
++                std::uint16_t value           = 0u;
++                if (global_row < rows) {
++                    value = load_vec<std::uint16_t>(
++                        scales + global_row * scale_row_bytes +
++                        (static_cast<std::int64_t>(chunk) * kTernaryMmaGroupsPerChunk +
++                         group_in_chunk) *
++                            PQ2RowSplitStorage::kScaleBytesPerGroup);
++                }
++                scale_sh[buf][warp][local_row][group_in_chunk] = value;
++            }
++        }
++
++        { // activation tile: 8 tokens x 256 k, staged cooperatively by the whole CTA.
++            // Written as a stride loop rather than `tok = tid >> 5` so it stays correct for any
++            // warp count: with 4 warps that expression would only ever cover tokens 0..3.
++            // These offsets are in bf16 ELEMENTS, not bytes: x is a __nv_bfloat16* while the code
++            // staging above is byte-based because `codes` is a std::uint8_t*. A byte offset here
++            // over-advances the source window by 2x and walks past the end of each token's row,
++            // which presents as "values plausible but wrong, NaN at the tail" rather than as a
++            // clean bounds error.
++            // 16 bytes (8 bf16) per cp.async, and a chunk is kTernaryMmaChunkK elements per token,
++            // so the number of copies a lane issues scales with the chunk width -- at 512 each lane
++            // covers an element offset and that offset + 256.
++            for (int tok = warp; tok < kTernaryMmaTokens; tok += kTernaryMmaWarpsPerCta) {
++                const int global_tok = tok_base + tok;
++                // Tokens past the end of the sequence are zero-filled (src_bytes 0 reads nothing),
++                // so the mma sees a defined activation and the guarded store drops the result.
++                const int safe_tok = (global_tok < tokens) ? global_tok : tok_base;
++                for (int elem = lane * 8; elem < kTernaryMmaChunkK; elem += 32 * 8) {
++                    cp_async_zfill<16>(
++                        &act_sh[buf][tok][elem],
++                        x + static_cast<std::int64_t>(safe_tok) * k + chunk_k + elem,
++                        (global_tok < tokens) ? 16 : 0);
++                }
++            }
++        }
++    };
++
++    // Walk the sequence in tiles of kTernaryMmaTokens tokens.
++    //
++    // The weight window is re-staged for every tile, because accumulators for the whole sequence
++    // would not fit in registers. That amortises each weight read across kTernaryMmaTokens tokens
++    // -- the same factor the reference kernel gets from its 8-token tile, but through a kernel that
++    // sustains ~400 GiB/s instead of ~60 GiB/s. Above 8 tokens this replaces a fallback that cost
++    // prefill a factor of ~8 against the non-ternary engine.
++    const int row_lo = row0 + warp * kTernaryMmaRowsPerWarp + gid;
++    const int row_hi = row_lo + 8;
++
++    for (int tok_base = 0; tok_base < tokens; tok_base += kTernaryMmaTokens) {
++        float acc0 = 0.0f;
++        float acc1 = 0.0f;
++        float acc2 = 0.0f;
++        float acc3 = 0.0f;
++
++        stage(0, 0, tok_base);
++        cp_commit();
++
++        for (int chunk = 0; chunk < chunks; ++chunk) {
++            const int buf = chunk & 1;
++
++            if (chunk + 1 < chunks) {
++                stage(buf ^ 1, chunk + 1, tok_base);
++                cp_commit();
++                cp_wait<1>(); // chunk `buf` has landed; chunk+1 may still be in flight
++            } else {
++                cp_wait<0>();
++            }
++            __syncthreads();
++
++#pragma unroll 1
++        for (int group_in_chunk = 0; group_in_chunk < kTernaryMmaGroupsPerChunk;
++             ++group_in_chunk) {
++            float g0 = 0.0f;
++            float g1 = 0.0f;
++            float g2 = 0.0f;
++            float g3 = 0.0f;
++
++#pragma unroll
++            for (int step = 0; step < 8; ++step) {
++                const int kstep    = group_in_chunk * 8 + step;
++                const int word_off = kstep * 4; // one k-step of 16 codes == one 4-byte word
++
++                // A operand: rows gid and gid+8, each contributing k and k+8 pairs.
++                const unsigned word_lo =
++                    load_vec<unsigned>(&codes_sh[buf][warp][gid][word_off]);
++                const unsigned word_hi =
++                    load_vec<unsigned>(&codes_sh[buf][warp][gid + 8][word_off]);
++                const unsigned shift_near = 8u * static_cast<unsigned>(lid >> 1);
++                const unsigned shift_far  = 8u * static_cast<unsigned>((lid >> 1) + 2);
++
++                const uint2 near_lo = lut[(word_lo >> shift_near) & 0xFFu];
++                const uint2 far_lo  = lut[(word_lo >> shift_far) & 0xFFu];
++                const uint2 near_hi = lut[(word_hi >> shift_near) & 0xFFu];
++                const uint2 far_hi  = lut[(word_hi >> shift_far) & 0xFFu];
++
++                // A quad of lanes shares a byte; lanes with an odd lid need its high code pair.
++                const bool odd = (lid & 1) != 0;
++                const unsigned a0 = odd ? near_lo.y : near_lo.x;
++                const unsigned a1 = odd ? near_hi.y : near_hi.x;
++                const unsigned a2 = odd ? far_lo.y : far_lo.x;
++                const unsigned a3 = odd ? far_hi.y : far_hi.x;
++
++                // B operand: the activation tile is already n-major (token rows, k contiguous),
++                // which is exactly the .col layout the mma wants -- no transpose needed.
++                unsigned bf0 = 0u;
++                unsigned bf1 = 0u;
++                ldmatrix_x2(bf0, bf1,
++                            smem_addr(&act_sh[buf][lane & 7]
++                                            [kstep * 16 + ((lane >> 3) & 1) * 8]));
++
++                mma_bf16(g0, g1, g2, g3, a0, a1, a2, a3, bf0, bf1);
++            }
++
++            // One PQ2_0 group spans eight k-steps, so its scale is applied once, per row.
++            const float top = __half2float(
++                __ushort_as_half(scale_sh[buf][warp][gid][group_in_chunk]));
++            const float bottom = __half2float(
++                __ushort_as_half(scale_sh[buf][warp][gid + 8][group_in_chunk]));
++            acc0 = fmaf(g0, top, acc0);
++            acc1 = fmaf(g1, top, acc1);
++            acc2 = fmaf(g2, bottom, acc2);
++            acc3 = fmaf(g3, bottom, acc3);
++        }
++
++            __syncthreads(); // the next stage reuses this buffer
++        }
++
++        // C fragment: c0/c1 are rows gid, columns 2*lid / 2*lid+1; c2/c3 are rows gid+8.
++        const int token_a = tok_base + 2 * lid;
++        const int token_b = token_a + 1;
++
++        if (row_lo < rows) {
++            if (token_a < tokens) {
++                out[static_cast<std::int64_t>(token_a) * out_row_stride + row_lo] =
++                    __float2bfloat16_rn(acc0);
++            }
++            if (token_b < tokens) {
++                out[static_cast<std::int64_t>(token_b) * out_row_stride + row_lo] =
++                    __float2bfloat16_rn(acc1);
++            }
++        }
++        if (row_hi < rows) {
++            if (token_a < tokens) {
++                out[static_cast<std::int64_t>(token_a) * out_row_stride + row_hi] =
++                    __float2bfloat16_rn(acc2);
++            }
++            if (token_b < tokens) {
++                out[static_cast<std::int64_t>(token_b) * out_row_stride + row_hi] =
++                    __float2bfloat16_rn(acc3);
++            }
++        }
++    }
++}
++
++} // namespace ninfer::ops::detail
+--- a/src/ops/linear/ternary/ternary_rowsplit_storage.cuh
++++ b/src/ops/linear/ternary/ternary_rowsplit_storage.cuh
+@@ -0,0 +1,109 @@
++// MODIFIED for the NInfer ternary port (Ternary Bonsai 2 27B on NInfer / Ada sm_89).
++// This file differs from upstream NInfer; see patches/ in the release bundle
++// for the change list, rebuild steps and required verification.
++#pragma once
++
++#include <cuda_bf16.h>
++#include <cuda_fp16.h>
++
++#include <cstdint>
++
++namespace ninfer::ops::detail {
++
++// Prism-private ternary weights, group 128, carried by NInfer's row-split-k128-v1 layout:
++//
++//   [ base plane ][ high plane ][ scale plane ]      scale = one binary16 per group
++//
++// PTQ1_0  base = qs[24]  base-3 trits, five per byte     high = qh[2], four per byte
++// PQ2_0   base = qs[32]  two-bit slots, four per byte    high = absent
++//
++// The split is not a reinterpretation: it is exactly how row_split_geometry() cuts a
++// payload for these formats (group_size 128, base 24/32, high 2/0, scale 2), and the
++// sizes it derives were checked byte for byte against the artifact reader
++// ([248320,5120] -> PTQ1_0 278,118,400 B / PQ2_0 337,715,200 B).
++
++struct PTQ1RowSplitStorage {
++    static constexpr int kGroupK             = 128;
++    static constexpr int kCodeBytesPerGroup  = 24;
++    static constexpr int kHighBytesPerGroup  = 2;
++    static constexpr int kScaleBytesPerGroup = 2;
++};
++
++struct PQ2RowSplitStorage {
++    static constexpr int kGroupK             = 128;
++    static constexpr int kCodeBytesPerGroup  = 32;
++    static constexpr int kHighBytesPerGroup  = 0;
++    static constexpr int kScaleBytesPerGroup = 2;
++};
++
++// 3^n for n in [0,5], as the table ggml's dequantizer reads. Kept as a branch chain so no
++// device-side array lookup is needed on the hot path.
++__device__ __forceinline__ constexpr std::uint8_t ternary_pow3(int n) {
++    return n <= 0 ? 1u : n == 1 ? 3u : n == 2 ? 9u : n == 3 ? 27u : n == 4 ? 81u : 243u;
++}
++
++__device__ __forceinline__ float ternary_scale(const std::uint8_t* scale_ptr) {
++    return __half2float(__ushort_as_half(*reinterpret_cast<const std::uint16_t*>(scale_ptr)));
++}
++
++// PQ2_0: block_pq2_0 { fp16 d; uint8 qs[32] } -> (code - 1) * d, code in {0,1,2}.
++// Per-weight form of dequantize_row_pq2_0 (ggml-quants.c). qs lives in the base plane.
++struct PQ2SimtDecodeAtom {
++    static constexpr int kGroupK = PQ2RowSplitStorage::kGroupK;
++
++    static __device__ __forceinline__ float load_scale(const std::uint8_t* scale_ptr) {
++        return ternary_scale(scale_ptr);
++    }
++
++    static __device__ __forceinline__ float decode_one(const std::uint8_t* codes,
++                                                       const std::uint8_t* high, float scale,
++                                                       int index) {
++        (void) high; // PQ2_0 stores no high plane; row_split_geometry reports 0 bytes for it
++        const int code = (static_cast<int>(codes[index >> 2]) >> (2 * (index & 3))) & 0x3;
++        return static_cast<float>(code - 1) * scale;
++    }
++};
++
++// PTQ1_0: block_ptq1_0 { uint8 qs[24]; uint8 qh[2]; fp16 d } with ptq1_0_stages {32,16,8}.
++//
++// Literal port of dequantize_row_ptq1_0. The stage walk matters and is not symmetric:
++// for a 24-byte qs the c=32 stage never runs (0 + 32 > 24), c=16 runs once and emits
++// weights 0..79 reading qs[0..15], c=8 runs once and emits weights 80..119 reading
++// qs[16..23]; the 2-byte qh then carries weights 120..127. That is 80 + 40 + 8 = 128.
++// Each trit is recovered as ((uint16)(q * 3^n) * 3) >> 8, with the uint8 wrap-around that
++// the C code relies on (`uint8_t q = qs[..] * pow3[n];` truncates on assignment).
++struct PTQ1SimtDecodeAtom {
++    static constexpr int kGroupK = PTQ1RowSplitStorage::kGroupK;
++
++    static __device__ __forceinline__ float load_scale(const std::uint8_t* scale_ptr) {
++        return ternary_scale(scale_ptr);
++    }
++
++    // qs lives in the base plane, qh in the high plane.
++    static __device__ __forceinline__ float decode_one(const std::uint8_t* codes,
++                                                       const std::uint8_t* high, float scale,
++                                                       int index) {
++        std::uint8_t raw;
++        int trit;
++        if (index < 80) {
++            // c = 16 stage: weights n*16 + m, byte qs[m]
++            trit = index >> 4;
++            raw  = codes[index & 15];
++        } else if (index < 120) {
++            // c = 8 stage: weights 80 + n*8 + m, byte qs[16 + m]
++            const int local = index - 80;
++            trit            = local >> 3;
++            raw             = codes[16 + (local & 7)];
++        } else {
++            // qh tail: weights 120 + n*2 + h, byte qh[h]
++            const int local = index - 120;
++            trit            = local >> 1;
++            raw             = high[local & 1];
++        }
++        const std::uint8_t q = static_cast<std::uint8_t>(raw * ternary_pow3(trit));
++        const int xi         = static_cast<int>((static_cast<std::uint16_t>(q) * 3u) >> 8);
++        return static_cast<float>(xi - 1) * scale;
++    }
++};
++
++} // namespace ninfer::ops::detail
+--- a/src/ops/wrapper/attn_input_proj.cpp
++++ b/src/ops/wrapper/attn_input_proj.cpp
+@@ -3,6 +3,9 @@
+ #include "ops/attn_input_proj/bf16/bf16_attn_input_plan.h"
+ #include "ops/attn_input_proj/q4_q5/q4_q5_attn_input_plan.h"
+ #include "ops/attn_input_proj/w8/w8_attn_input_plan.h"
++#include "ops/linear/ternary/ternary_dispatch.h"
++#include "ops/linear/ternary/ternary_row_view.h"
++#include "ops/linear/ternary/ternary_rotation.h"
+ 
+ #include <cstddef>
+ #include <cstdint>
+@@ -154,6 +157,60 @@
+     throw std::invalid_argument("attn_input_proj workspace: unsupported parent qtype");
+ }
+ 
++namespace {
++
++// --- 折叠（旋转基）三元双父权重 --------------------------------------------------------------
++//
++// 三元父权重沿用 Q4/Q5 的 row-split 布局，但组几何是 128 宽，故 Q4/Q5 的必需几何校验无法接纳
++// 它们，它们的融合分派也跑不了。
++
++bool is_ternary_attn_parent(QType qtype) noexcept {
++    return qtype == QType::PTQ1_0_G128 || qtype == QType::PQ2_0_G128;
++}
++
++void require_ternary_attn_parents(const Weight& query_key_weight,
++                                  const Weight& gate_value_weight, std::int32_t rows,
++                                  std::int32_t hidden) {
++    const Weight* const parents[]{&query_key_weight, &gate_value_weight};
++    for (const Weight* parent : parents) {
++        if (!is_ternary_attn_parent(parent->qtype) || parent->layout != QuantLayout::RowSplit ||
++            parent->scale_dtype != DType::FP16 || parent->group != 128 || parent->ndim != 2 ||
++            parent->k != hidden || parent->shape[1] != hidden ||
++            parent->padded_shape[1] != hidden || (parent->k % 1024) != 0) {
++            throw std::invalid_argument(
++                "attn_input_proj: unsupported ternary split parent geometry");
++        }
++    }
++    const Weight* const both[]{&query_key_weight, &gate_value_weight};
++    for (const Weight* parent : both) {
++        if (parent->n != rows || parent->shape[0] != rows) {
++            throw std::invalid_argument(
++                "attn_input_proj: ternary split parent has the wrong row count");
++        }
++    }
++    if (query_key_weight.qtype != gate_value_weight.qtype) {
++        throw std::invalid_argument(
++            "attn_input_proj: both ternary split parents must use the same format");
++    }
++}
++
++// 四个投影的激活宽度都是 hidden，所以一次旋转就能服务全部四个。
++void launch_ternary_attn(const Tensor& activation, const Weight& query_key_weight,
++                         const Weight& gate_value_weight, Tensor& q, Tensor& gate, Tensor& k,
++                         Tensor& v, std::int32_t query_rows, std::int32_t kv_rows,
++                         cudaStream_t stream) {
++    const Weight q_head = detail::ternary_row_view(query_key_weight, 0, query_rows);
++    const Weight k_tail = detail::ternary_row_view(query_key_weight, query_rows, kv_rows);
++    const Weight g_head = detail::ternary_row_view(gate_value_weight, 0, query_rows);
++    const Weight v_tail = detail::ternary_row_view(gate_value_weight, query_rows, kv_rows);
++    detail::ternary_dispatch_basis(activation, q_head, q, LinearPolicy::A16Only, stream);
++    detail::ternary_dispatch_basis(activation, g_head, gate, LinearPolicy::A16Only, stream);
++    detail::ternary_dispatch_basis(activation, k_tail, k, LinearPolicy::A16Only, stream);
++    detail::ternary_dispatch_basis(activation, v_tail, v, LinearPolicy::A16Only, stream);
++}
++
++} // namespace
++
+ void attn_input_proj(const Tensor& x, const Weight& query_key_weight,
+                      const Weight& gate_value_weight, Tensor& q, Tensor& gate, Tensor& k, Tensor& v,
+                      cudaStream_t stream) {
+@@ -166,6 +223,21 @@
+     require_matrix(gate, kQRows, cols, "gate");
+     require_matrix(k, kKvRows, cols, "k");
+     require_matrix(v, kKvRows, cols, "v");
++
++    if (is_ternary_attn_parent(query_key_weight.qtype)) {
++        require_ternary_attn_parents(query_key_weight, gate_value_weight, kQRows + kKvRows, kHidden);
++        if (detail::ternary_rotation_enabled()) {
++            // 折叠父权重需要一块 [5120, T] 的旋转缓冲，而这个入口没有工作区可用。
++            // 宁可在这里明确报错，也不要拿未变换的权重跑出一个看似合理的结果。
++            throw std::invalid_argument(
++                "attn_input_proj: folded ternary parents need the workspace overload "
++                "(or NINFER_TERNARY_HADAMARD=0 to measure without the rotation)");
++        }
++        launch_ternary_attn(x, query_key_weight, gate_value_weight, q, gate, k, v, kQRows, kKvRows,
++                            stream);
++        return;
++    }
++
+     require_rowsplit(query_key_weight, QType::Q4G64_F16S, kQRows + kKvRows, "query/key weight");
+     require_rowsplit(gate_value_weight, QType::Q5G64_F16S, kQRows + kKvRows, "gate/value weight");
+ 
+@@ -173,6 +245,32 @@
+                                       stream);
+ }
+ 
++void attn_input_proj(const Tensor& x, const Weight& query_key_weight,
++                     const Weight& gate_value_weight, Tensor& q, Tensor& gate, Tensor& k, Tensor& v,
++                     WorkspaceArena& workspace, cudaStream_t stream) {
++    constexpr std::int32_t kHidden = 5120;
++    constexpr std::int32_t kQRows  = 6144;
++    constexpr std::int32_t kKvRows = 1024;
++    const std::int32_t cols        = x.ne[1];
++    require_matrix(x, kHidden, cols, "x");
++    require_matrix(q, kQRows, cols, "q");
++    require_matrix(gate, kQRows, cols, "gate");
++    require_matrix(k, kKvRows, cols, "k");
++    require_matrix(v, kKvRows, cols, "v");
++
++    if (!is_ternary_attn_parent(query_key_weight.qtype)) {
++        attn_input_proj(x, query_key_weight, gate_value_weight, q, gate, k, v, stream);
++        return;
++    }
++    require_ternary_attn_parents(query_key_weight, gate_value_weight, kQRows + kKvRows, kHidden);
++    // 作用域限定：本调用返回时旋转 scratch 就归还，不会在加载过程中多次构图里累积。
++    auto scope = workspace.scope();
++    const Tensor activation =
++        detail::folded_activation(x, query_key_weight, workspace, stream);
++    launch_ternary_attn(activation, query_key_weight, gate_value_weight, q, gate, k, v, kQRows,
++                        kKvRows, stream);
++}
++
+ void attn_input_proj(const Tensor& x, const Weight& query_key_gate_value_weight, Tensor& q,
+                      Tensor& gate, Tensor& k, Tensor& v, LinearPolicy policy,
+                      WorkspaceArena& workspace, cudaStream_t stream) {
+--- a/src/ops/wrapper/embedding.cpp
++++ b/src/ops/wrapper/embedding.cpp
+@@ -2,13 +2,18 @@
+ #include "ninfer/ops/embedding.h"
+ 
+ #include "ops/common/math.h"
++#include "ops/linear/ternary/ternary_rotation.h"
+ #include "ops/launcher/embed_gather.h" // detail::embed_gather_*_launch
++#include "core/device.h"
+ #include "core/weight.h"
+ 
+ #include <cstdint>
++#include <cstdio>
++#include <cstdlib>
+ #include <limits>
+ #include <stdexcept>
+ #include <string>
++#include <vector>
+ 
+ namespace ninfer::ops {
+ namespace {
+@@ -167,6 +172,63 @@
+     }
+ }
+ 
++// Prism 三元词表：组宽 128，基平面（qs）+ 可选高位平面（qh，仅 PTQ1_0）+ 每组一个 binary16 缩放。
++// 平面几何与 row_split_geometry() 一致，其尺寸已逐字节对照制品读取器核验过
++// （[248320,5120] -> PTQ1_0 278,118,400 B / PQ2_0 337,715,200 B）。
++void require_ternary_metadata(const Weight& table, const Tensor& out, std::int32_t code_bytes,
++                              std::int32_t high_bytes, const char* label) {
++    constexpr std::int32_t kGroup = 128;
++    const std::string tag         = std::string("embedding: ") + label;
++
++    if (table.layout != QuantLayout::RowSplit) {
++        throw std::invalid_argument(tag + " table must be RowSplit");
++    }
++    require_weight_2d(table);
++    if (table.group_size != kGroup || table.group != kGroup) {
++        throw std::invalid_argument(tag + " table group must be 128");
++    }
++    if (table.scale_dtype != DType::FP16) {
++        throw std::invalid_argument(tag + " table scale dtype must be FP16");
++    }
++    if (table.padded_shape[0] != table.shape[0] ||
++        table.padded_shape[1] != align_up_i32(table.shape[1], 128)) {
++        throw std::invalid_argument(tag + " padded shape is invalid");
++    }
++    if (table.shape[1] != out.ne[0]) {
++        throw std::invalid_argument(tag + " table d must match out.ne[0]");
++    }
++
++    const std::uint64_t rows = static_cast<std::uint64_t>(table.shape[0]);
++    const std::uint64_t kg   = static_cast<std::uint64_t>(table.padded_shape[1] / kGroup);
++    const std::uint64_t code_plane_bytes =
++        checked_mul_u64(checked_mul_u64(rows, kg), static_cast<std::uint64_t>(code_bytes));
++    const std::uint64_t high_plane_bytes =
++        checked_mul_u64(checked_mul_u64(rows, kg), static_cast<std::uint64_t>(high_bytes));
++    const std::uint64_t scale_plane_bytes = checked_mul_u64(checked_mul_u64(rows, kg), 2);
++    const std::uint64_t high_plane_off    = ((code_plane_bytes + 255u) / 256u) * 256u;
++    const std::uint64_t scale_plane_off =
++        high_plane_off + ((high_plane_bytes + 255u) / 256u) * 256u;
++    const std::uint64_t expected = scale_plane_off + scale_plane_bytes;
++    if (table.payload_bytes != 0 && table.payload_bytes < expected) {
++        throw std::invalid_argument(tag + " payload is too small");
++    }
++    if (table.qdata == nullptr || table.scales == nullptr) {
++        throw std::invalid_argument(tag + " planes must be non-null");
++    }
++    if (high_bytes == 0) {
++        if (table.qhigh != nullptr || table.high_plane_bytes != 0) {
++            throw std::invalid_argument(tag + " high plane must be empty");
++        }
++    } else {
++        if (table.qhigh == nullptr) {
++            throw std::invalid_argument(tag + " high plane must be non-null");
++        }
++        if (table.high_plane_bytes < high_plane_bytes) {
++            throw std::invalid_argument(tag + " high plane is too small");
++        }
++    }
++}
++
+ bool is_empty_T(const Tensor& ids, const Tensor& out) { return ids.ne[0] == 0 || out.ne[1] == 0; }
+ 
+ void require_non_empty_tensors(const Tensor& ids, const Tensor& out) {
+@@ -178,11 +240,77 @@
+     }
+ }
+ 
++// Prism 三元词表把行折叠存进旋转基，所以查出来的一行还不是可入残差流的激活：模型在查表之后
++// 计算 h = s * (H * z)，这是整个模型里唯一一处逆向映射。
++//
++// 就地映射不花任何 scratch，这正是"无工作区的 embedding 算子"签名得以保持不变的原因。
++// NINFER_TERNARY_HADAMARD=0 时这个映射与其它折叠基变换一起被跳过。
++void unrotate_folded_embedding(Tensor& out, const Weight& table, cudaStream_t stream) {
++    if (!detail::ternary_rotation_enabled()) { return; }
++    if (!detail::ternary_weight_is_folded(table)) {
++        throw std::invalid_argument(
++            "embedding: folded ternary table has no sign block; the artifact must carry "
++            "text/hadamard_signs and text/hadamard_widths");
++    }
++    detail::launch_ternary_rotation_inverse_inplace(out, table, stream);
++}
++
++// 诊断钩子：NINFER_TERNARY_DUMP_EMBED=<file> 会把 token id 与【最终】的 embedding 激活（逆向
++// 映射之后）写盘，供外部 oracle 拿制品的载荷核对整条查表路径。残差流正是从这里进入第 0 层，
++// 所以这一点断掉会让后面所有数字失去意义 —— 表现为困惑度接近均匀分布。
++// 落盘的是原始 BF16，由 oracle 自行加宽。输出路径必须是纯 ASCII。
++void dump_embedding_if_requested(const Tensor& ids, const Tensor& out, cudaStream_t stream,
++                                 const char* stage) {
++    const char* path = std::getenv("NINFER_TERNARY_DUMP_EMBED");
++    if (path == nullptr || *path == '\0') { return; }
++    // 构图会把本算子重放一遍，而那时流正在捕获：下面的 device->host 拷贝与"让 dump 有意义的"
++    // 同步在捕获期都是非法的。跳过捕获意味着 dump 落在第一次真实重放上，而那一次才是真正在意
++    // 的数值。
++    cudaStreamCaptureStatus capture = cudaStreamCaptureStatusNone;
++    if (cudaStreamIsCapturing(stream, &capture) != cudaSuccess ||
++        capture != cudaStreamCaptureStatusNone) {
++        return;
++    }
++    const std::int32_t hidden   = out.ne[0];
++    const std::int32_t tokens   = out.ne[1];
++    const std::int32_t id_count = static_cast<std::int32_t>(ids.numel());
++    std::vector<std::int32_t> host_ids(static_cast<std::size_t>(id_count));
++    std::vector<std::uint16_t> host_raw(static_cast<std::size_t>(hidden) * tokens);
++    CUDA_CHECK(cudaMemcpyAsync(host_ids.data(), ids.data, host_ids.size() * sizeof(std::int32_t),
++                               cudaMemcpyDeviceToHost, stream));
++    CUDA_CHECK(cudaMemcpyAsync(host_raw.data(), out.data, host_raw.size() * sizeof(std::uint16_t),
++                               cudaMemcpyDeviceToHost, stream));
++    CUDA_CHECK(cudaStreamSynchronize(stream));
++
++    // 每个 (阶段, token 数) 一个文件，这样"查出来的行"和"映射后的行"能区分开，且 prefill 的
++    // dump 不会被之后的 decode dump 覆盖。
++    char suffixed[1024];
++    std::snprintf(suffixed, sizeof(suffixed), "%s.%s.T%d", path, stage, tokens);
++    std::FILE* file = std::fopen(suffixed, "wb");
++    if (file == nullptr) {
++        std::fprintf(stderr, "embedding: cannot open dump path %s\n", suffixed);
++        return;
++    }
++    const std::int32_t header[3] = {tokens, hidden, id_count};
++    std::fwrite(header, sizeof(std::int32_t), 3, file);
++    std::fwrite(host_ids.data(), sizeof(std::int32_t), host_ids.size(), file);
++    std::fwrite(host_raw.data(), sizeof(std::uint16_t), host_raw.size(), file);
++    std::fclose(file);
++    std::fprintf(stderr, "embedding: dumped ids=%d hidden=%d tokens=%d -> %s\n", id_count, hidden,
++                 tokens, path);
++}
++
+ } // namespace
+ 
+ void embedding(const Tensor& ids, const Weight& table, Tensor& out, cudaStream_t stream) {
+     if (ids.dtype != DType::I32) { throw std::invalid_argument("embedding: ids must be I32"); }
+     if (out.dtype != DType::BF16) { throw std::invalid_argument("embedding: out must be BF16"); }
++    if (std::getenv("NINFER_TERNARY_TRACE_EMBED") != nullptr) {
++        std::fprintf(stderr,
++                     "embedding: qtype=%d ids.ne=[%d,%d] out.ne=[%d,%d] -> axes via ids.ne[0]=%d\n",
++                     static_cast<int>(table.qtype), ids.ne[0], ids.ne[1], out.ne[0], out.ne[1],
++                     ids.ne[0]);
++    }
+ 
+     (void)numel_allow_zero(ids, "ids");
+     (void)numel_allow_zero(out, "out");
+@@ -212,6 +340,24 @@
+         require_non_empty_tensors(ids, out);
+         detail::embed_gather_w8_launch(ids, table, out, stream);
+         break;
++    case QType::PQ2_0_G128:
++        require_ternary_metadata(table, out, 32, 0, "PQ2_0_G128");
++        if (is_empty_T(ids, out)) { return; }
++        require_non_empty_tensors(ids, out);
++        detail::embed_gather_pq2_launch(ids, table, out, stream);
++        dump_embedding_if_requested(ids, out, stream, "pre");
++        unrotate_folded_embedding(out, table, stream);
++        dump_embedding_if_requested(ids, out, stream, "post");
++        break;
++    case QType::PTQ1_0_G128:
++        require_ternary_metadata(table, out, 24, 2, "PTQ1_0_G128");
++        if (is_empty_T(ids, out)) { return; }
++        require_non_empty_tensors(ids, out);
++        detail::embed_gather_ptq1_launch(ids, table, out, stream);
++        dump_embedding_if_requested(ids, out, stream, "pre");
++        unrotate_folded_embedding(out, table, stream);
++        dump_embedding_if_requested(ids, out, stream, "post");
++        break;
+     default:
+         throw std::invalid_argument("embedding: unsupported table qtype");
+     }
+--- a/src/ops/wrapper/gdn_input_proj.cpp
++++ b/src/ops/wrapper/gdn_input_proj.cpp
+@@ -6,9 +6,13 @@
+ #include "ops/gdn_input_proj/q4_q5/q4_q5_gdn_input_plan.h"
+ #include "ops/gdn_input_proj/w8/w8_gdn_input_kernels.h"
+ #include "ops/gdn_input_proj/w8/w8_gdn_input_plan.h"
++#include "ops/linear/ternary/ternary_dispatch.h"
++#include "ops/linear/ternary/ternary_row_view.h"
++#include "ops/linear/ternary/ternary_rotation.h"
+ 
+ #include <algorithm>
+ #include <array>
++#include <cstddef>
+ #include <cstdint>
+ #include <stdexcept>
+ #include <string>
+@@ -430,6 +434,66 @@
+ 
+ } // namespace
+ 
++namespace {
++
++// --- 折叠（旋转基）三元双父权重 --------------------------------------------------------------
++//
++// 三元父权重沿用 Q4/Q5 的 row-split 布局，但组几何不同（128 宽；PTQ1_0 每组 24 + 2 字节，
++// PQ2_0 每组 32 字节且无高位平面），故 Q4/Q5 的必需几何校验无法接纳它们，它们的融合分派也跑不了。
++
++bool is_ternary_parent(QType qtype) noexcept {
++    return qtype == QType::PTQ1_0_G128 || qtype == QType::PQ2_0_G128;
++}
++
++// 本 target 上 GDN 输入投影恒定消费 5120 宽的隐藏态。
++constexpr std::int32_t kFoldedGdnHidden = 5120;
++// q 2048 + k 2048 + v 6144：折叠三元与 Q4/Q5 共用这一行几何，也正因如此两条容量查询必须分开。
++constexpr std::int32_t kFoldedGdnChannels = 10240;
++
++void require_ternary_split_parents(const Weight& qk_weight, const Weight& value_z_weight,
++                                   std::int32_t qk_rows, std::int32_t parent_rows,
++                                   std::int32_t hidden) {
++    const Weight* const parents[]{&qk_weight, &value_z_weight};
++    for (const Weight* parent : parents) {
++        if (!is_ternary_parent(parent->qtype) || parent->layout != QuantLayout::RowSplit ||
++            parent->scale_dtype != DType::FP16 || parent->group != 128 || parent->ndim != 2 ||
++            parent->k != hidden || parent->shape[1] != hidden ||
++            parent->padded_shape[1] != hidden || (parent->k % 1024) != 0) {
++            throw std::invalid_argument("gdn_input_proj: unsupported ternary split parent geometry");
++        }
++    }
++    if (qk_weight.n != qk_rows || qk_weight.shape[0] != qk_rows) {
++        throw std::invalid_argument("gdn_input_proj: ternary qk parent has the wrong row count");
++    }
++    if (value_z_weight.n != parent_rows || value_z_weight.shape[0] != parent_rows) {
++        throw std::invalid_argument("gdn_input_proj: ternary value/z parent has the wrong row count");
++    }
++    if (qk_weight.qtype != value_z_weight.qtype) {
++        throw std::invalid_argument(
++            "gdn_input_proj: both ternary split parents must use the same format");
++    }
++}
++
++void launch_ternary_split(const Tensor& activation, const Weight& qk_weight,
++                          const Weight& value_z_weight, Tensor& qkv, Tensor& z,
++                          std::int32_t qk_rows, std::int32_t value_rows, std::int32_t z_rows,
++                          cudaStream_t stream) {
++    const Weight value_head = detail::ternary_row_view(value_z_weight, 0, value_rows);
++    const Weight value_tail = detail::ternary_row_view(value_z_weight, value_rows, z_rows);
++    // ninfer 的 ne[0] 连续布局下，融合 qkv 输出的 token 步长等于它的【行数】，所以两半必须被告知
++    // 父权重的步长，而不是各自的步长。
++    const std::int32_t qkv_rows = qk_rows + value_rows;
++    Tensor qk_out               = qkv.slice(0, 0, qk_rows);
++    Tensor value_out            = qkv.slice(0, qk_rows, value_rows);
++    detail::ternary_dispatch_basis_strided(activation, qk_weight, qk_out, qkv_rows,
++                                           LinearPolicy::A16Only, stream);
++    detail::ternary_dispatch_basis_strided(activation, value_head, value_out, qkv_rows,
++                                           LinearPolicy::A16Only, stream);
++    detail::ternary_dispatch_basis(activation, value_tail, z, LinearPolicy::A16Only, stream);
++}
++
++} // namespace
++
+ void gdn_input_proj(const Tensor& x, const Weight& qk_weight, const Weight& value_z_weight,
+                     Tensor& qkv, Tensor& z, cudaStream_t stream) {
+     constexpr std::int32_t kHidden     = 5120;
+@@ -443,12 +507,53 @@
+     require_matrix(x, kHidden, cols, "x");
+     require_matrix(qkv, kQkvRows, cols, "qkv");
+     require_matrix(z, kZRows, cols, "z");
++
++    if (is_ternary_parent(qk_weight.qtype)) {
++        require_ternary_split_parents(qk_weight, value_z_weight, kQkRows, kParentRows, kHidden);
++        if (detail::ternary_rotation_enabled()) {
++            // 折叠父权重需要一块 [5120, T] 的旋转缓冲，而这个入口没有工作区可用。
++            // 宁可在这里明确报错，也不要拿未变换的权重跑出一个看似合理的结果。
++            throw std::invalid_argument(
++                "gdn_input_proj: folded ternary parents need the workspace overload "
++                "(or NINFER_TERNARY_HADAMARD=0 to measure without the rotation)");
++        }
++        launch_ternary_split(x, qk_weight, value_z_weight, qkv, z, kQkRows, kValueRows, kZRows,
++                             stream);
++        return;
++    }
++
+     require_rowsplit(qk_weight, QType::Q4G64_F16S, kQkRows, "qk weight");
+     require_rowsplit(value_z_weight, QType::Q5G64_F16S, kParentRows, "value/z weight");
+ 
+     detail::q4_q5_gdn_input_dispatch(x, qk_weight, value_z_weight, qkv, z, stream);
+ }
+ 
++void gdn_input_proj(const Tensor& x, const Weight& qk_weight, const Weight& value_z_weight,
++                    Tensor& qkv, Tensor& z, WorkspaceArena& workspace, cudaStream_t stream) {
++    constexpr std::int32_t kHidden     = 5120;
++    constexpr std::int32_t kQkRows     = 4096;
++    constexpr std::int32_t kValueRows  = 6144;
++    constexpr std::int32_t kZRows      = 6144;
++    constexpr std::int32_t kQkvRows    = kQkRows + kValueRows;
++    constexpr std::int32_t kParentRows = kValueRows + kZRows;
++    const std::int32_t cols            = x.ne[1];
++    if (cols <= 0) { throw std::invalid_argument("gdn_input_proj: T must be positive"); }
++    require_matrix(x, kHidden, cols, "x");
++    require_matrix(qkv, kQkvRows, cols, "qkv");
++    require_matrix(z, kZRows, cols, "z");
++
++    if (!is_ternary_parent(qk_weight.qtype)) {
++        gdn_input_proj(x, qk_weight, value_z_weight, qkv, z, stream);
++        return;
++    }
++    require_ternary_split_parents(qk_weight, value_z_weight, kQkRows, kParentRows, kHidden);
++    // 作用域限定：本调用返回时旋转 scratch 就归还，不会在加载过程中多次构图里累积。
++    auto scope              = workspace.scope();
++    const Tensor activation = detail::folded_activation(x, qk_weight, workspace, stream);
++    launch_ternary_split(activation, qk_weight, value_z_weight, qkv, z, kQkRows, kValueRows,
++                         kZRows, stream);
++}
++
+ std::size_t gdn_input_proj_workspace_capacity_bytes(QType parent_qtype, std::int32_t parent_rows,
+                                                     std::int32_t input_rows, LinearPolicy policy,
+                                                     std::int32_t min_tokens,
+@@ -520,6 +625,22 @@
+     return layout.peak_bytes(1);
+ }
+ 
++std::size_t gdn_input_proj_conv_snapshot_folded_workspace_capacity_bytes(
++    std::int32_t query_rows, std::int32_t key_rows, std::int32_t value_rows,
++    std::int32_t batch_size, std::int32_t min_width, std::int32_t max_width) {
++    const std::int32_t channels = query_rows + key_rows + value_rows;
++    if (channels != kFoldedGdnChannels) {
++        throw std::invalid_argument(
++            "gdn_input_proj_conv_snapshot folded workspace: unregistered shape");
++    }
++    require_snapshot_capacity_domain(batch_size, min_width, max_width);
++    // 折叠父权重一律走"先投影进 scratch、再做卷积"的组合路线，所以两块缓冲都在同一个作用域里
++    // 存活：投影平面之后是激活旋转缓冲。列数取查询区间的上端，因为两者都随列数单调。
++    const std::int32_t columns = batch_size > 1 ? batch_size * max_width : max_width;
++    return composed_snapshot_capacity(
++        channels, columns, detail::ternary_rotation_workspace_bytes(kFoldedGdnHidden, columns));
++}
++
+ std::size_t gdn_input_proj_conv_record_workspace_capacity_bytes(
+     std::int32_t query_rows, std::int32_t key_rows, std::int32_t value_rows,
+     std::int32_t batch_size, std::int32_t min_width, std::int32_t max_width) {
+@@ -539,6 +660,21 @@
+     return 0;
+ }
+ 
++std::size_t gdn_input_proj_conv_record_folded_workspace_capacity_bytes(
++    std::int32_t query_rows, std::int32_t key_rows, std::int32_t value_rows,
++    std::int32_t batch_size, std::int32_t min_width, std::int32_t max_width) {
++    const std::int32_t channels = query_rows + key_rows + value_rows;
++    if (channels != kFoldedGdnChannels) {
++        throw std::invalid_argument(
++            "gdn_input_proj_conv_record folded workspace: unregistered shape");
++    }
++    require_record_capacity_domain(batch_size, min_width, max_width);
++    // 投影本身写进调用方的 conv record，所以唯一需要的临时字节就是折叠 GEMM 的激活旋转缓冲，
++    // 而它按展平后的列数（B*T）取。
++    const std::int32_t columns = batch_size > 1 ? batch_size * max_width : max_width;
++    return detail::ternary_rotation_workspace_bytes(kFoldedGdnHidden, columns);
++}
++
+ void gdn_input_proj_conv_snapshot(const Tensor& x, const Weight& qk_weight,
+                                   const Weight& value_z_weight, const Tensor& conv_weight,
+                                   Tensor& conv_states, const Tensor& valid_columns,
+@@ -554,8 +690,15 @@
+     constexpr std::int32_t kChannels   = kQueryRows + kKeyRows + kValueRows;
+     constexpr std::int32_t kParentRows = kValueRows + kZRows;
+     const ConvGeometry geometry        = require_snapshot_input(x, kHidden);
+-    require_rowsplit(qk_weight, QType::Q4G64_F16S, kQueryRows + kKeyRows, "qk weight");
+-    require_rowsplit(value_z_weight, QType::Q5G64_F16S, kParentRows, "value/z weight");
++    // 折叠三元父权重是 128 宽组几何、而非 64，Q4/Q5 的必需几何校验跑不了；它们自己的校验放在
++    // 下面的三元分支里。
++    if (is_ternary_parent(qk_weight.qtype)) {
++        require_ternary_split_parents(qk_weight, value_z_weight, kQueryRows + kKeyRows, kParentRows,
++                                      kHidden);
++    } else {
++        require_rowsplit(qk_weight, QType::Q4G64_F16S, kQueryRows + kKeyRows, "qk weight");
++        require_rowsplit(value_z_weight, QType::Q5G64_F16S, kParentRows, "value/z weight");
++    }
+     require_snapshot_operands(conv_weight, conv_states, valid_columns, initial_state_slots,
+                               snapshot_base_slots, kChannels, geometry);
+     require_conv_tensor(query, kQueryRows, geometry.width, geometry.batch,
+@@ -567,6 +710,33 @@
+     require_conv_tensor(z, kZRows, geometry.width, geometry.batch, "gdn_input_proj_conv_snapshot",
+                         "z");
+ 
++    if (is_ternary_parent(qk_weight.qtype)) {
++        require_ternary_split_parents(qk_weight, value_z_weight, kQueryRows + kKeyRows, kParentRows,
++                                      kHidden);
++        if (geometry.batch > 1) {
++            compose_batched_snapshot(
++                x, conv_weight, conv_states, valid_columns, initial_state_slots,
++                snapshot_base_slots, query, key, value, z, kQueryRows, kKeyRows, kValueRows,
++                geometry, ws, stream,
++                [&](const Tensor& x_flat, Tensor& projected, Tensor& z_flat) {
++                    gdn_input_proj(x_flat, qk_weight, value_z_weight, projected, z_flat, ws,
++                                   stream);
++                });
++            return;
++        }
++        // 融合的"投影 + epilogue"调度只服务 Q4/Q5，所以折叠三元父权重一律走组合路线：
++        // 先用共享三元 GEMM 投影，再做卷积。
++        auto scope                 = ws.scope();
++        ProjectedWorkspace scratch = allocate_projected_workspace(ws, kChannels, geometry.width);
++        const Tensor activation = detail::folded_activation(x, qk_weight, ws, stream);
++        launch_ternary_split(activation, qk_weight, value_z_weight, scratch.projected, z,
++                             kQueryRows + kKeyRows, kValueRows, kZRows, stream);
++        detail::gdn_projected_conv_snapshot_launch(scratch.projected, conv_weight, conv_states,
++                                                   valid_columns, initial_state_slots,
++                                                   snapshot_base_slots, query, key, value, stream);
++        return;
++    }
++
+     if (geometry.batch > 1) {
+         compose_batched_snapshot(
+             x, conv_weight, conv_states, valid_columns, initial_state_slots, snapshot_base_slots,
+@@ -608,8 +778,14 @@
+     constexpr std::int32_t kChannels   = kQueryRows + kKeyRows + kValueRows;
+     constexpr std::int32_t kParentRows = kValueRows + kZRows;
+     const ConvGeometry geometry        = require_record_input(x, kHidden);
+-    require_rowsplit(qk_weight, QType::Q4G64_F16S, kQueryRows + kKeyRows, "qk weight");
+-    require_rowsplit(value_z_weight, QType::Q5G64_F16S, kParentRows, "value/z weight");
++    // 见 snapshot 处的说明：折叠三元父权重使用 128 宽的组几何。
++    if (is_ternary_parent(qk_weight.qtype)) {
++        require_ternary_split_parents(qk_weight, value_z_weight, kQueryRows + kKeyRows, kParentRows,
++                                      kHidden);
++    } else {
++        require_rowsplit(qk_weight, QType::Q4G64_F16S, kQueryRows + kKeyRows, "qk weight");
++        require_rowsplit(value_z_weight, QType::Q5G64_F16S, kParentRows, "value/z weight");
++    }
+     require_record_operands(conv_weight, conv_states, valid_columns, initial_state_slots, kChannels,
+                             geometry);
+     require_conv_tensor(conv_record, kChannels, geometry.width, geometry.batch,
+@@ -625,6 +801,24 @@
+     require_record_nonoverlap(x, conv_weight, conv_states, valid_columns, initial_state_slots,
+                               conv_record, query, key, value, z, workspace);
+ 
++    if (is_ternary_parent(qk_weight.qtype)) {
++        require_ternary_split_parents(qk_weight, value_z_weight, kQueryRows + kKeyRows, kParentRows,
++                                      kHidden);
++        // 融合的"投影 + epilogue"调度只服务 Q4/Q5，所以折叠三元父权重一律先用共享三元 GEMM
++        // 投影，再重放卷积。
++        compose_record(x, conv_weight, conv_states, valid_columns, initial_state_slots, conv_record,
++                       query, key, value, z, geometry, workspace, stream,
++                       [&](const Tensor& x_flat, Tensor& record_flat, Tensor& z_flat) {
++                           auto lambda_scope = workspace.scope();
++                           const Tensor activation =
++                               detail::folded_activation(x_flat, qk_weight, workspace, stream);
++                           launch_ternary_split(activation, qk_weight, value_z_weight, record_flat,
++                                                z_flat, kQueryRows + kKeyRows, kValueRows, kZRows,
++                                                stream);
++                       });
++        return;
++    }
++
+     const detail::Q4Q5GdnInputConvPlan plan =
+         resolve_q4_q5_conv_plan(geometry.width, geometry.batch);
+     if (plan.schedule == detail::Q4Q5GdnInputConvScheduleId::ProjectionEpilogueFused) {
+--- a/src/ops/wrapper/linear_add.cpp
++++ b/src/ops/wrapper/linear_add.cpp
+@@ -1,5 +1,8 @@
+ #include "ninfer/ops/linear_add.h"
+ 
++#include "ninfer/ops/residual_add.h"
++#include "ops/linear/ternary/ternary_dispatch.h"
++#include "ops/linear/ternary/ternary_rotation.h"
+ #include "ops/linear_add/bf16/bf16_linear_add_plan.h"
+ #include "ops/linear_add/q5/q5_linear_add_plan.h"
+ #include "ops/linear_add/w8/w8_linear_add_plan.h"
+@@ -102,6 +105,14 @@
+         return detail::q5_linear_add_capacity_workspace_bytes(output_rows, input_rows, input_rows,
+                                                               min_tokens, max_tokens);
+     }
++    if (qtype == QType::PTQ1_0_G128 || qtype == QType::PQ2_0_G128) {
++        if (policy != LinearPolicy::A16Only) {
++            throw std::invalid_argument("linear_add workspace: ternary admits only A16");
++        }
++        // 折叠三元路线先用共享三元 GEMM 投影到一个作用域内的 [N, T] scratch，再把残差折进去，
++        // 因此它既需要投影 scratch，也需要激活的旋转缓冲。
++        return detail::ternary_projection_workspace_bytes(output_rows, input_rows, max_tokens);
++    }
+     throw std::invalid_argument("linear_add workspace: unsupported weight format");
+ }
+ 
+@@ -173,6 +184,19 @@
+         return;
+     }
+ 
++    if (w.qtype == QType::PTQ1_0_G128 || w.qtype == QType::PQ2_0_G128) {
++        if (policy != LinearPolicy::A16Only) {
++            throw std::invalid_argument("ternary linear_add admits only A16");
++        }
++        // residual_out += W * x。没有融合的三元残差核，就用共享三元 GEMM 加现成的逐元素加法拼出来。
++        // GEMM 同时把 x 映射进折叠基，这正是投影 scratch 与旋转缓冲都取自本 op 工作区的原因。
++        auto scope       = ws.scope();
++        Tensor projected = ws.alloc(DType::BF16, {w.n, t});
++        detail::ternary_dispatch(x, w, projected, policy, &ws, stream);
++        residual_add(projected, residual_out, stream);
++        return;
++    }
++
+     throw std::invalid_argument("linear_add: unsupported weight format");
+ }
+ 
+--- a/src/ops/wrapper/linear_swiglu.cpp
++++ b/src/ops/wrapper/linear_swiglu.cpp
+@@ -1,5 +1,8 @@
+ #include "ninfer/ops/linear_swiglu.h"
+ 
++#include "ninfer/ops/silu_mul.h"
++#include "ops/linear/ternary/ternary_dispatch.h"
++#include "ops/linear/ternary/ternary_rotation.h"
+ #include "ops/linear_swiglu/q4/q4_linear_swiglu_plan.h"
+ #include "ops/linear_swiglu/w8/w8_linear_swiglu_plan.h"
+ 
+@@ -50,6 +53,14 @@
+         return detail::q4_linear_swiglu_capacity_workspace_bytes(
+             gate_up_rows, gate_up_rows / 2, input_rows, input_rows, min_tokens, max_tokens);
+     }
++    if (qtype == QType::PTQ1_0_G128 || qtype == QType::PQ2_0_G128) {
++        if (policy != LinearPolicy::A16Only) {
++            throw std::invalid_argument("linear_swiglu workspace: ternary admits only A16");
++        }
++        // 折叠三元路线把整个融合的 gate/up 父权重投影进一个作用域内的 [2*intermediate, T]
++        // scratch，随后复用 silu_mul，因此需要那块 scratch 加上激活的旋转缓冲。
++        return detail::ternary_projection_workspace_bytes(gate_up_rows, input_rows, max_tokens);
++    }
+     throw std::invalid_argument("linear_swiglu workspace: unsupported weight format");
+ }
+ 
+@@ -97,10 +108,30 @@
+                            gate_up_weight.group_size == 32 && gate_up_weight.group == 32 &&
+                            gate_up_weight.qhigh == nullptr &&
+                            gate_up_weight.high_plane_bytes == 0 && common_row_split;
+-    if (!q4_weight && !w8_weight) {
++    const bool ternary_weight =
++        large_shape &&
++        (gate_up_weight.qtype == QType::PTQ1_0_G128 ||
++         gate_up_weight.qtype == QType::PQ2_0_G128) &&
++        gate_up_weight.group == 128 && common_row_split;
++    if (!q4_weight && !w8_weight && !ternary_weight) {
+         throw std::invalid_argument("linear_swiglu: unsupported weight");
+     }
+ 
++    if (ternary_weight) {
++        if (policy != LinearPolicy::A16Only) {
++            throw std::invalid_argument("ternary linear_swiglu admits only A16");
++        }
++        // out = silu(gate) * up。没有融合的三元 SwiGLU 核，就用共享三元 GEMM 投影整个融合父权重
++        // （它同时把 x 映射进折叠基），再对两个半行区间复用现成的逐元素 silu_mul —— 与 MTP 路径
++        // 对它的 W8 gate/up 父权重做法完全一致。
++        auto scope     = ws.scope();
++        Tensor gate_up = ws.alloc(DType::BF16, {gate_up_weight.n, t});
++        detail::ternary_dispatch(x, gate_up_weight, gate_up, policy, &ws, stream);
++        const std::int32_t rows = gate_up_weight.n / 2;
++        silu_mul(gate_up.slice(0, 0, rows), gate_up.slice(0, rows, rows), out, stream);
++        return;
++    }
++
+     if (policy != LinearPolicy::A16Only) {
+         throw std::invalid_argument("linear_swiglu: Q4/W8 admit only A16");
+     }
+--- a/src/targets/qwen3_6/impl/runtime/dflash_impl.h
++++ b/src/targets/qwen3_6/impl/runtime/dflash_impl.h
+@@ -287,7 +287,9 @@
+         if (state.execution.proposal_head == ProposalHead::Full) {
+             Tensor logits = state.execution.work.alloc(
+                 DType::BF16, {TextConfig::output_rows, static_cast<std::int32_t>(k) * batch_size});
++            // 见 text_prefill_impl.h：三元 output head 需要一块激活旋转缓冲。
+             ops::linear(proposal_hidden, state.execution.model.output_head, logits,
++                        ops::LinearPolicy::A16Only, state.execution.work,
+                         state.execution.device.stream);
+             ops::argmax(logits, flat_drafts, TextConfig::token_domain,
+                         state.execution.device.stream);
+--- a/src/targets/qwen3_6/impl/runtime/text_context_impl.h
++++ b/src/targets/qwen3_6/impl/runtime/text_context_impl.h
+@@ -566,7 +566,9 @@
+                                       ctx_.stream);
+     } else {
+         Tensor output_logits = matrix_window(logits, T);
+-        ops::linear(hidden, *lm_head_, output_logits, ctx_.stream);
++        // 带工作区的重载：折叠（旋转基）三元 output head 需要一块 [hidden, T] 的激活旋转缓冲。
++        ops::linear(hidden, *lm_head_, output_logits, ops::LinearPolicy::A16Only, work_,
++                    ctx_.stream);
+         ops::argmax(output_logits, proposal_tokens, kCfg.token_domain, ctx_.stream);
+     }
+ }
+@@ -671,7 +673,7 @@
+         NullTap tap;
+         run_layers(x, Phase::Verify, tap);
+         ops::rmsnorm(x, *final_norm_, kCfg.rms_eps, true, hidden, stream);
+-        ops::linear(hidden, *lm_head_, logits, stream);
++        ops::linear(hidden, *lm_head_, logits, ops::LinearPolicy::A16Only, work_, stream);
+     }
+     work_.reset();
+ }
+@@ -729,7 +731,7 @@
+         Tensor flat_logits = logits.view({kCfg.vocab, columns});
+         Tensor flat_tokens = target_tokens.view({columns});
+         ops::rmsnorm(x, *final_norm_, kCfg.rms_eps, true, flat_hidden, stream);
+-        ops::linear(flat_hidden, *lm_head_, flat_logits, stream);
++        ops::linear(flat_hidden, *lm_head_, flat_logits, ops::LinearPolicy::A16Only, work_, stream);
+         ops::argmax(flat_logits, flat_tokens, kCfg.token_domain, stream);
+     }
+     work_.reset();
+@@ -1174,7 +1176,7 @@
+             if (is_last) {
+                 Tensor last_xf = xf.slice(1, len - 1, 1);
+                 Tensor logits  = matrix_window(io_.logits, 1);
+-                ops::linear(last_xf, *lm_head_, logits, s);
++                ops::linear(last_xf, *lm_head_, logits, ops::LinearPolicy::A16Only, work_, s);
+                 // Set io_.pos to the bonus token's absolute position (base + T) before picking so
+                 // the sampler RNG is keyed by it (prefill purpose keeps it distinct from the first
+                 // decode step, which reuses the same io_.pos).
+--- a/src/targets/qwen3_6/impl/runtime/text_prefill_impl.h
++++ b/src/targets/qwen3_6/impl/runtime/text_prefill_impl.h
+@@ -145,7 +145,10 @@
+     }
+     state.execution.work.reset();
+     Tensor logits = state.execution.io.logits.slice(1, 0, 1);
+-    ops::linear(hidden, state.execution.model.output_head, logits, state.execution.device.stream);
++    // 带工作区的重载：折叠（旋转基）三元 output head 需要一块 [hidden, 1] 的激活旋转缓冲，
++    // 而此处只有这个竞技场可用。
++    ops::linear(hidden, state.execution.model.output_head, logits, ops::LinearPolicy::A16Only,
++                state.execution.work, state.execution.device.stream);
+     CUDA_CHECK(cudaMemcpyAsync(state.execution.io.pos.data, &absolute_position,
+                                sizeof(absolute_position), cudaMemcpyHostToDevice,
+                                state.execution.device.stream));
+--- a/src/targets/qwen3_6_27b/export/ninfer/targets/qwen3_6_27b/package.h
++++ b/src/targets/qwen3_6_27b/export/ninfer/targets/qwen3_6_27b/package.h
+@@ -29,9 +29,14 @@
+ 
+ struct Variant;
+ 
++// 权重档案描述"制品里存在哪些张量、以及规划期要为它们预留多少临时字节"。行几何不足以区分
++// groupwise-int 转换产物与折叠（旋转基）三元产物 —— 两者的 GDN/attention 形状完全相同 —— 所以
++// 折叠三元必须有自己的一档，否则规划期的容量查询只能取两者的上界，而引擎要求查询值恰好等于
++// 执行高水位。
+ enum class WeightsProfile : std::uint8_t {
+     GroupwiseInt,
+     GroupwiseIntW8Endpoints,
++    FoldedTernary,
+ };
+ 
+ using Frontend       = qwen3_6::Frontend;
+@@ -81,6 +86,9 @@
+     static constexpr std::string_view target_key         = "qwen3_6_27b";
+     static constexpr std::string_view qwen3_8_model_id   = "qwen3.8-27b";
+     static constexpr std::string_view qwen3_8_target_key = "qwen3_8_27b";
++    // 折叠三元制品的 identity.weights_id。绑定期并不看它 —— 每个权重的格式由制品自己的声明
++    // 决定 —— 但规划期的容量查询看不到权重，只能靠它区分两档。
++    static constexpr std::string_view folded_weights_id = "folded-ternary";
+ 
+     using WeightsProfile  = detail::WeightsProfile;
+     using LoadPlan        = detail::LoadPlan;
+--- a/src/targets/qwen3_6_27b/impl/load/bindings.cpp
++++ b/src/targets/qwen3_6_27b/impl/load/bindings.cpp
+@@ -37,19 +37,157 @@
+         return NumericFormat::Q6G64_F16S;
+     case WeightsProfile::GroupwiseIntW8Endpoints:
+         return NumericFormat::W8G32_F16S;
++    case WeightsProfile::FoldedTernary:
++        // 词表两端在折叠三元制品里是三元张量，但这里返回的值只用于选中"读制品声明"那条绑定
++        // 路径（见 is_row_split_grouped），实际格式一律取自制品自己。PTQ1_0_G128 与
++        // PQ2_0_G128 走的是同一条路径，所以同一个档案能同时服务两种三元打包。
++        return NumericFormat::PTQ1_0_G128;
+     }
+     throw std::invalid_argument("qwen3_6_27b: invalid weights profile");
+ }
+ 
++// 分组 row-split 家族在容器层面是可以互换的：每个成员共享 row-split-k128-v1 布局，只在组几何
++// 与码打包上不同，而制品会声明它存的是哪一个。所以这里解析【制品声明的】格式，而不是听信计划
++// 的预期 —— 这正是同一个运行时既能读 groupwise-int 转换产物（Q4G64/Q5G64/Q6G64/W8G32）、
++// 又能读三元移植产物（PTQ1_0_G128/PQ2_0_G128）的原因。
++//
++// 这个放宽是刻意收窄的：声明出来的格式本身必须也是分组 row-split 格式，而且 bind_tensor()
++// 依旧校验布局与形状，所以任一方向的错配仍会被拒。下游一律读 WeightPlan::format，因此在这里
++// 解析好就等于传播到了所有 materialized_weight() 调用点，无需逐个改。
++bool is_row_split_grouped(NumericFormat format) {
++    switch (format) {
++    case NumericFormat::Q4G64_F16S:
++    case NumericFormat::Q5G64_F16S:
++    case NumericFormat::Q6G64_F16S:
++    case NumericFormat::W8G32_F16S:
++    case NumericFormat::PTQ1_0_G128:
++    case NumericFormat::PQ2_0_G128:
++        return true;
++    default:
++        return false;
++    }
++}
++
++// 折叠基特征置换 P。只有 GDN 输出投影是"分组列"存储、而运行时产出分块 v-head 几何，所以这里
++// 同时按对象的【角色】和它的输入宽度设门，而不是只看宽度。头数取自模型：n_v = 48 个 v-head，
++// n_k = 16 个 k 组（于是 K = 6144 = 128 * 16 * 3）。
++void set_folded_perm(WeightPlan& plan, std::string_view name, std::uint64_t columns) {
++    constexpr std::uint64_t kGdnOutputWidth = 6144;
++    constexpr std::int32_t kNv             = 48;
++    constexpr std::int32_t kNk             = 16;
++    if (name.ends_with("/gdn/output") && columns == kGdnOutputWidth) {
++        plan.hadamard_perm_hd  = static_cast<std::int32_t>(columns) / kNv;
++        plan.hadamard_perm_nk  = kNk;
++        plan.hadamard_perm_rep = kNv / kNk;
++    }
++}
++
+ WeightPlan bind_weight(artifact::Binder& binder, std::string_view name, NumericFormat format,
+                        std::initializer_list<std::uint64_t> shape) {
+-    return WeightPlan{.object = artifact::bind_device_tensor(binder, name, format, shape),
+-                      .format = format};
+-}
++    const std::uint64_t columns = shape.size() > 1 ? shape.begin()[1] : 0;
++    if (is_row_split_grouped(format)) {
++        const artifact::ObjectDescriptor* descriptor = binder.find(name);
++        if (descriptor == nullptr ||
++            !std::holds_alternative<artifact::TensorDescriptor>(*descriptor)) {
++            throw artifact::ArtifactError(std::string(name) + ": expected a tensor object");
++        }
++        const NumericFormat declared = std::get<artifact::TensorDescriptor>(*descriptor).format;
++        if (!is_row_split_grouped(declared)) {
++            throw artifact::ArtifactError(std::string(name) +
++                                          ": artifact declares a non-grouped format for a "
++                                          "row-split weight");
++        }
++        WeightPlan plan{.object = artifact::bind_device_tensor(binder, name, declared, shape),
++                        .format = declared};
++        set_folded_perm(plan, name, columns);
++        return plan;
++    }
++    WeightPlan plan{.object = artifact::bind_device_tensor(binder, name, format, shape),
++                    .format = format};
++    set_folded_perm(plan, name, columns);
++    return plan;
++}
++
++// --- 折叠（旋转基）符号表 -----------------------------------------------------
++//
++// 见 bindings.h 对该表的说明。下面这些常量描述三元移植写出的制品契约：1024 宽归一化
++// Sylvester-Hadamard 分块、28672 个显式符号，以及恰好把符号切分完的若干宽度。
++inline constexpr std::int32_t kHadamardBlockSize = 1024;
++inline constexpr std::size_t kHadamardSignValues = 28672;
++inline constexpr std::size_t kHadamardWidthCount = 3;
++
++std::uint32_t read_u32_le(std::span<const std::byte> bytes, std::size_t offset,
++                          const char* label) {
++    if (offset + sizeof(std::uint32_t) > bytes.size()) {
++        throw artifact::ArtifactError(std::string(label) + " is truncated");
++    }
++    return std::to_integer<std::uint32_t>(bytes[offset]) |
++           (std::to_integer<std::uint32_t>(bytes[offset + 1]) << 8U) |
++           (std::to_integer<std::uint32_t>(bytes[offset + 2]) << 16U) |
++           (std::to_integer<std::uint32_t>(bytes[offset + 3]) << 24U);
++}
++
++// 加载期作用域：只在一次物化过程中安装，随后拆除，因此没有任何全局状态活过一次加载。把符号块
++// 挂在这里 —— 构造每个 Weight 的唯一漏斗 —— 正是让三十个 materialized_weight() 调用点无需改动
++// 的原因。
++struct FoldedSigns {
++    const float* base = nullptr;
++    std::vector<std::pair<std::int32_t, std::uint64_t>> width_offsets;
++
++    [[nodiscard]] const float* for_width(std::int32_t width) const noexcept {
++        for (const auto& entry : width_offsets) {
++            if (entry.first == width) { return base + entry.second; }
++        }
++        return nullptr;
++    }
++};
++
++FoldedSigns* g_folded_signs = nullptr;
++
++class FoldedSignsScope {
++public:
++    FoldedSignsScope(const std::optional<HadamardSignsPlan>& plan,
++                     const artifact::MaterializedArtifact& materialized) {
++        if (!plan.has_value()) { return; }
++        table_.base          = static_cast<const float*>(materialized.device_data(plan->values));
++        table_.width_offsets = plan->width_offsets;
++        if (table_.base != nullptr) { g_folded_signs = &table_; }
++    }
++    ~FoldedSignsScope() { g_folded_signs = nullptr; }
++
++    FoldedSignsScope(const FoldedSignsScope&)            = delete;
++    FoldedSignsScope& operator=(const FoldedSignsScope&) = delete;
++
++private:
++    FoldedSigns table_;
++};
+ 
+ Weight materialized_weight(const artifact::MaterializedArtifact& materialized,
+                            const WeightPlan& plan, std::int32_t rows, std::int32_t columns) {
+-    return artifact::materialized_weight(materialized, plan.object, plan.format, rows, columns);
++    // 三元权重恰好就是折叠权重（制品里 402 个三元张量 = 401 个折叠权重 + 一个做逆映射的词嵌入
++    // 表），所以只看格式就能判定是否需要符号块。
++    const auto attach_folded_signs = [&](Weight& w) {
++        if (g_folded_signs == nullptr) { return; }
++        if (plan.format != NumericFormat::PTQ1_0_G128 &&
++            plan.format != NumericFormat::PQ2_0_G128) {
++            return;
++        }
++        const float* signs = g_folded_signs->for_width(columns);
++        if (signs == nullptr) {
++            throw artifact::ArtifactError(
++                "folded ternary weight has no sign block for input width " +
++                std::to_string(columns));
++        }
++        w.hadamard_signs    = signs;
++        w.hadamard_n_blk    = columns / kHadamardBlockSize;
++        w.hadamard_perm_hd  = plan.hadamard_perm_hd;
++        w.hadamard_perm_nk  = plan.hadamard_perm_nk;
++        w.hadamard_perm_rep = plan.hadamard_perm_rep;
++    };
++
++    Weight out = artifact::materialized_weight(materialized, plan.object, plan.format, rows, columns);
++    attach_folded_signs(out);
++    return out;
+ }
+ 
+ Weight row_view(const Weight& block, std::int32_t row_begin, std::int32_t row_count) {
+@@ -57,11 +195,15 @@
+         block.layout != QuantLayout::RowSplit) {
+         throw std::logic_error("invalid target row view");
+     }
+-    const std::uint64_t groups    = static_cast<std::uint64_t>(block.padded_shape[1] / block.group);
+-    const std::uint64_t low_group = 32;
+-    const std::uint64_t high_group = block.qtype == QType::Q5G64_F16S   ? 8
+-                                     : block.qtype == QType::Q6G64_F16S ? 16
+-                                                                        : 0;
++    const std::uint64_t groups = static_cast<std::uint64_t>(block.padded_shape[1] / block.group);
++    // row-split 平面几何是按格式而定的：Q4/Q5/Q6/W8 每组 32 个基础字节，而 PTQ1_0 是 24 基础
++    // + 2 高位，PQ2_0 是 32 基础且无高位平面。对 PTQ1_0 套用默认的 32/0 会从载荷里切出错位的
++    // 字节区间。
++    const std::uint64_t low_group  = block.qtype == QType::PTQ1_0_G128 ? 24 : 32;
++    const std::uint64_t high_group = block.qtype == QType::Q5G64_F16S    ? 8
++                                     : block.qtype == QType::Q6G64_F16S  ? 16
++                                     : block.qtype == QType::PTQ1_0_G128 ? 2
++                                                                         : 0;
+     const std::uint64_t low_row    = groups * low_group;
+     const std::uint64_t high_row   = groups * high_group;
+     const std::uint64_t scale_row  = groups * 2;
+@@ -222,6 +364,9 @@
+     (void)bind("dflash2/candidate_selector/successor_codebook", NumericFormat::BF16, {248320, 256});
+ }
+ 
++// 定义在下方，紧挨着消费它的那次物化过程。
++std::optional<HadamardSignsPlan> bind_hadamard_signs(artifact::Binder& binder);
++
+ ArtifactLoadPlan bind_artifact(artifact::Binder& binder, WeightsProfile weights_profile,
+                                qwen3_6::StartupFeatures features) {
+     ArtifactLoadPlan load_plan;
+@@ -235,6 +380,10 @@
+     switch (weights_profile) {
+     case WeightsProfile::GroupwiseInt:
+     case WeightsProfile::GroupwiseIntW8Endpoints:
++    case WeightsProfile::FoldedTernary:
++        // 三档共用同一张文本层对象表：绑定层按对象名与制品声明的格式物化，从不看权重档案，
++        // 所以折叠三元制品在这里与 groupwise-int 制品走完全相同的代码。档案的差别只在规划期
++        // 的临时容量查询上。
+         bind_groupwise_text_layers(binder, out);
+         break;
+     default:
+@@ -243,6 +392,7 @@
+     out.final_norm =
+         artifact::bind_device_tensor(binder, "text/final_norm", NumericFormat::BF16, {5120});
+     out.output_head = bind_weight(binder, "text/output_head", vocabulary_format, {248320, 5120});
++    out.hadamard_signs = bind_hadamard_signs(binder);
+     const artifact::TensorPlacement proposal_placement =
+         features.optimized_proposal() ? artifact::TensorPlacement::Device
+                                       : artifact::TensorPlacement::ValidateOnly;
+@@ -300,9 +450,47 @@
+     return load_plan;
+ }
+ 
++// 当制品携带折叠符号表时把它绑上。权重未折叠的制品直接省略这些对象，而每个对象都必须被绑定，
++// 否则 Binder::finish() 会以"有对象未被消费"拒绝该制品 —— 所以只要对象存在，这就不是可选项。
++std::optional<HadamardSignsPlan> bind_hadamard_signs(artifact::Binder& binder) {
++    if (!binder.contains("text/hadamard_signs")) { return std::nullopt; }
++
++    HadamardSignsPlan plan;
++    plan.values = artifact::bind_device_tensor(binder, "text/hadamard_signs", NumericFormat::FP32,
++                                               {kHadamardSignValues});
++    plan.widths = artifact::bind_tensor(binder, "text/hadamard_widths", NumericFormat::I32,
++                                        {kHadamardWidthCount},
++                                        artifact::TensorPlacement::ValidateOnly);
++
++    // 宽度只需要到达主机：它们在这里被读出来推导每个宽度的元素偏移，正是这一点让权重仅凭输入
++    // 维度就能找到自己的分块。
++    const artifact::PayloadSpan payload = binder.payload(plan.widths);
++    if (payload.data.size() < kHadamardWidthCount * sizeof(std::uint32_t)) {
++        throw artifact::ArtifactError("text/hadamard_widths is shorter than its declared count");
++    }
++    std::uint64_t offset = 0;
++    for (std::size_t i = 0; i < kHadamardWidthCount; ++i) {
++        const std::uint32_t width =
++            read_u32_le(payload.data, i * sizeof(std::uint32_t), "text/hadamard_widths");
++        if (width == 0) {
++            throw artifact::ArtifactError("text/hadamard_widths entries must be positive");
++        }
++        plan.width_offsets.emplace_back(static_cast<std::int32_t>(width), offset);
++        offset += width;
++    }
++    if (offset != kHadamardSignValues) {
++        throw artifact::ArtifactError("text/hadamard_widths must sum to " +
++                                      std::to_string(kHadamardSignValues) + ", got " +
++                                      std::to_string(offset));
++    }
++    return plan;
++}
++
+ LoadedModelData::LoadedModelData(BindingPlan plan, artifact::MaterializedArtifact materialized)
+     : backing(std::move(materialized)) {
+     frontend = qwen3_6::take_frontend_resources(backing, plan.frontend);
++    // 为下面整段物化过程安装折叠符号表。
++    const FoldedSignsScope folded_signs_scope(plan.hadamard_signs, backing);
+ 
+     runtime.weights_arena = &backing.device_arena();
+     runtime.features      = plan.features;
+--- a/src/targets/qwen3_6_27b/impl/load/bindings.h
++++ b/src/targets/qwen3_6_27b/impl/load/bindings.h
+@@ -13,8 +13,10 @@
+ #include <array>
+ #include <cstddef>
+ #include <cstdint>
++#include <optional>
+ #include <utility>
+ #include <variant>
++#include <vector>
+ 
+ namespace ninfer::targets::qwen3_6_27b::detail {
+ 
+@@ -25,6 +27,11 @@
+ struct WeightPlan {
+     artifact::ObjectHandle object;
+     artifact::NumericFormat format = artifact::NumericFormat::BF16;
++    // 本权重的折叠基特征置换；perm_rep == 1 表示"无"。
++    // 在绑定期按权重身份写入（只有 /gdn/output 带置换）。
++    std::int32_t hadamard_perm_hd  = 0;
++    std::int32_t hadamard_perm_nk  = 0;
++    std::int32_t hadamard_perm_rep = 1;
+ };
+ 
+ struct MlpPlan {
+@@ -91,6 +98,20 @@
+     artifact::ObjectHandle final_norm;
+ };
+ 
++// 旋转（折叠）权重基的符号表。
++//
++// 三元移植把线性权重折叠进一个旋转基存储，因此运行时必须在每个折叠矩阵乘【之前】把激活映射成
++// y = H * (s . x)，并在词嵌入查表【之后】映射成 h = s . (H * z)。`s` 放在一个制品对象里：
++// `values` 保存全部符号，`widths` 把它分段，因为输入维度为 W 的权重恰好拥有 W/block_size 行
++// 连续的符号。`width_offsets` 是 `widths` 的前缀和，于是权重只凭输入维度就能找到自己那一段。
++//
++// 权重未折叠的制品（groupwise-int 转换产物）没有这些对象，所以整体是 optional。
++struct HadamardSignsPlan {
++    artifact::ObjectHandle values;
++    artifact::ObjectHandle widths;
++    std::vector<std::pair<std::int32_t, std::uint64_t>> width_offsets;
++};
++
+ struct BindingPlan {
+     qwen3_6::FrontendResourcePlan frontend;
+     qwen3_6::StartupFeatures features;
+@@ -101,6 +122,8 @@
+     WeightPlan output_head;
+     artifact::ObjectHandle draft_head;
+     artifact::ObjectHandle draft_head_token_ids;
++    // 仅当制品存的是折叠（旋转基）权重时存在；三元移植的制品正是如此。
++    std::optional<HadamardSignsPlan> hadamard_signs;
+     MtpPlan mtp;
+ 
+     qwen3_6::VisionBackbonePlan vision_backbone;
+--- a/src/targets/qwen3_6_27b/impl/package.cpp
++++ b/src/targets/qwen3_6_27b/impl/package.cpp
+@@ -89,6 +89,9 @@
+     if (identity.model_id == qwen3_8_model_id && identity.weights_id == "groupwise-int") {
+         return WeightsProfile::GroupwiseIntW8Endpoints;
+     }
++    if (identity.model_id == qwen3_8_model_id && identity.weights_id == folded_weights_id) {
++        return WeightsProfile::FoldedTernary;
++    }
+     throw std::runtime_error("artifact identity '" + identity.model_id + "/" + identity.weights_id +
+                              "' is not supported by target '" + std::string(target_key) + "'");
+ }
+--- a/src/targets/qwen3_6_27b/impl/variant.cpp
++++ b/src/targets/qwen3_6_27b/impl/variant.cpp
+@@ -45,15 +45,45 @@
+ 
+ constexpr std::size_t kMinimumLeafWorkspaceBytes = 1;
+ 
++// 折叠（旋转基）三元激活 scratch：三元权重在矩阵乘之前需要的一块 [input_width, last] BF16 缓冲
++// （先 P、再符号、再名义上的 Hadamard）。
++//
++// 只有 WeightsProfile::FoldedTernary 会走到这里。绑定期不看权重档案，但规划期看不到权重，
++// 所以每个携带档案的容量查询都必须按档分派；把两档混为一档会让非三元制品也预留这块缓冲，
++// 而引擎要求容量查询的值恰好等于执行高水位。
++std::size_t folded_rotation_bytes(std::int32_t input_width, std::int32_t last) {
++    return ops::linear_workspace_capacity_bytes(QType::PQ2_0_G128, input_width, input_width,
++                                                ops::LinearPolicy::A16Only, 1, last);
++}
++
++// 折叠三元父权重的判定只能看【权重自己声明的格式】：这条路径在运行期，拿不到权重档案。
++bool is_folded_ternary_parent(const Weight& weight) noexcept {
++    return weight.qtype == QType::PTQ1_0_G128 || weight.qtype == QType::PQ2_0_G128;
++}
++
++const Weight& gdn_input_parent(const Variant::GdnProjectionWeights& weights) {
++    if (const auto* split = std::get_if<SplitGdnInputProjectionPayload>(&weights.input_projection)) {
++        return split->query_key;
++    }
++    return std::get<FusedGdnInputProjectionPayload>(weights.input_projection).query_key_value_z;
++}
++
++// record 路径的临时字节只能在这里算：gdn_input_projection_record 用它开一块【叶子竞技场】，
++// 而叶子竞技场的容量没有别处可定。上游那条 record 容量查询只服务融合的 Q4/Q5（返回 0），
++// 折叠三元的父权重在这条路径上仍要先把展平激活映射进旋转基，那块 [hidden, B*T] 缓冲得由这里
++// 补上，否则叶子竞技场只有 1 字节，算子会在第一次分配时撞上容量检查。
+ std::size_t gdn_record_workspace_bytes(const Tensor& hidden,
+                                        const Variant::GdnProjectionWeights& weights) {
+-    (void)weights;
+     const std::int32_t batch = hidden.ne[2];
+     const std::int32_t width = hidden.ne[1];
+-    return std::max(kMinimumLeafWorkspaceBytes,
+-                    ops::gdn_input_proj_conv_record_workspace_capacity_bytes(
+-                        TextConfig::key_dim, TextConfig::key_dim, TextConfig::value_dim, batch,
+-                        width, width));
++    std::size_t bytes        = ops::gdn_input_proj_conv_record_workspace_capacity_bytes(
++        TextConfig::key_dim, TextConfig::key_dim, TextConfig::value_dim, batch, width, width);
++    if (is_folded_ternary_parent(gdn_input_parent(weights))) {
++        // 取 max 而不是相加：规划期给这块叶子预留的就是这两者中的较大者，多算一字节同样是
++        // 超容量 —— 叶子竞技场是借来的，容量就是外层已经划出去的那一段。
++        bytes = std::max(bytes, folded_rotation_bytes(TextConfig::hidden, batch * width));
++    }
++    return std::max(kMinimumLeafWorkspaceBytes, bytes);
+ }
+ 
+ } // namespace
+@@ -102,10 +132,9 @@
+                                    const FullAttentionProjectionWeights& weights, Tensor& query,
+                                    Tensor& gate, Tensor& key, Tensor& value, qwen3_6::TextPhase,
+                                    WorkspaceArena& workspace, cudaStream_t stream) {
+-    (void)workspace;
+     if (const auto* split = std::get_if<SplitAttentionProjectionPayload>(&weights)) {
+         ops::attn_input_proj(hidden, split->query_key, split->gate_value, query, gate, key, value,
+-                             stream);
++                             workspace, stream);
+         return;
+     }
+     const Weight& fused = std::get<FusedAttentionProjectionPayload>(weights).query_key_gate_value;
+@@ -148,13 +177,12 @@
+ void Variant::gdn_input_projection(const Tensor& hidden, const GdnProjectionWeights& weights,
+                                    Tensor& qkv, Tensor& output_gate, qwen3_6::TextPhase,
+                                    WorkspaceArena& workspace, cudaStream_t stream) {
+-    (void)workspace;
+     Tensor output_gate_flat =
+         output_gate.view({TextConfig::value_dim, static_cast<int>(hidden.ne[1])});
+     if (const auto* split =
+             std::get_if<SplitGdnInputProjectionPayload>(&weights.input_projection)) {
+         ops::gdn_input_proj(hidden, split->query_key, split->value_z, qkv, output_gate_flat,
+-                            stream);
++                            workspace, stream);
+         return;
+     }
+     const Weight& fused =
+@@ -277,7 +305,11 @@
+     switch (weights_profile) {
+     case WeightsProfile::GroupwiseInt:
+     case WeightsProfile::GroupwiseIntW8Endpoints:
++        // 融合 groupwise 路线把投影写进调用方张量，不需要临时字节。
+         return 0;
++    case WeightsProfile::FoldedTernary:
++        // 本投影消费的是原始隐藏态，所以激活宽度是 5120。
++        return folded_rotation_bytes(TextConfig::hidden, last);
+     }
+     throw std::logic_error("invalid 27B weights profile");
+ }
+@@ -291,6 +323,12 @@
+         return ops::linear_add_workspace_capacity_bytes(QType::Q5G64_F16S, TextConfig::hidden,
+                                                         TextConfig::query_size,
+                                                         ops::LinearPolicy::A16Only, first, last);
++    case WeightsProfile::FoldedTernary:
++        // 三元路线折进残差时需要一块 [hidden, T] 的投影 scratch，再加上 [query_size, T] 的
++        // 激活旋转缓冲。
++        return ops::linear_add_workspace_capacity_bytes(QType::PQ2_0_G128, TextConfig::hidden,
++                                                        TextConfig::query_size,
++                                                        ops::LinearPolicy::A16Only, first, last);
+     }
+     throw std::logic_error("invalid 27B weights profile");
+ }
+@@ -304,6 +342,9 @@
+     case WeightsProfile::GroupwiseInt:
+     case WeightsProfile::GroupwiseIntW8Endpoints:
+         return 0;
++    case WeightsProfile::FoldedTernary:
++        // 见 attention_projection_workspace_capacity_bytes：本投影同样消费原始隐藏态。
++        return folded_rotation_bytes(TextConfig::hidden, last);
+     }
+     throw std::logic_error("invalid 27B weights profile");
+ }
+@@ -318,6 +359,11 @@
+         return ops::gdn_input_proj_conv_snapshot_workspace_capacity_bytes(
+             TextConfig::key_dim, TextConfig::key_dim, TextConfig::value_dim, batch_size, first,
+             last);
++    case WeightsProfile::FoldedTernary:
++        // 折叠父权重永不走融合调度，所以它的投影 scratch 与激活旋转缓冲都由这一档单独查询。
++        return ops::gdn_input_proj_conv_snapshot_folded_workspace_capacity_bytes(
++            TextConfig::key_dim, TextConfig::key_dim, TextConfig::value_dim, batch_size, first,
++            last);
+     }
+     throw std::logic_error("invalid 27B weights profile");
+ }
+@@ -333,6 +379,11 @@
+                         ops::gdn_input_proj_conv_record_workspace_capacity_bytes(
+                             TextConfig::key_dim, TextConfig::key_dim, TextConfig::value_dim,
+                             batch_size, first, last));
++    case WeightsProfile::FoldedTernary:
++        return std::max(kMinimumLeafWorkspaceBytes,
++                        ops::gdn_input_proj_conv_record_folded_workspace_capacity_bytes(
++                            TextConfig::key_dim, TextConfig::key_dim, TextConfig::value_dim,
++                            batch_size, first, last));
+     }
+     throw std::logic_error("invalid 27B weights profile");
+ }
+@@ -348,29 +399,47 @@
+         return ops::linear_add_workspace_capacity_bytes(QType::Q5G64_F16S, TextConfig::hidden,
+                                                         TextConfig::value_dim,
+                                                         ops::LinearPolicy::A16Only, first, last);
++    case WeightsProfile::FoldedTernary:
++        // 见 attention_output_projection_workspace_capacity_bytes：三元路线把 6144 宽的 GDN
++        // 输出喂进一块 [hidden, T] scratch，并旋转一块 [value_dim, T] 的激活。
++        return ops::linear_add_workspace_capacity_bytes(QType::PQ2_0_G128, TextConfig::hidden,
++                                                        TextConfig::value_dim,
++                                                        ops::LinearPolicy::A16Only, first, last);
+     }
+     throw std::logic_error("invalid 27B weights profile");
+ }
+ 
+ std::size_t Variant::gdn_norm_control_projection_workspace_capacity_bytes(std::int32_t first,
+                                                                           std::int32_t last) {
++    // 本查询是唯一一个不携带权重档案的：运行时模板把它与 35B 目标共用，而那一档没有折叠三元。
++    // A/B 控制投影在折叠三元制品里确实要旋转，所以这里无条件预留一块激活大小的缓冲；对
++    // groupwise-int 制品是保守的多留，不会少留。
+     return ops::gdn_norm_gating_proj_workspace_capacity_bytes(TextConfig::gdn_value_heads,
+-                                                              TextConfig::hidden, first, last);
++                                                              TextConfig::hidden, first, last) +
++           folded_rotation_bytes(TextConfig::hidden, last);
+ }
+ 
+ std::size_t Variant::post_mixer_workspace_capacity_bytes(WeightsProfile weights_profile,
+                                                          qwen3_6::TextPhase, std::int32_t first,
+                                                          std::int32_t last) {
+     validate_token_interval(first, last);
++    QType gate_up_qtype;
++    QType down_qtype;
+     switch (weights_profile) {
+     case WeightsProfile::GroupwiseInt:
+     case WeightsProfile::GroupwiseIntW8Endpoints:
++        gate_up_qtype = QType::Q4G64_F16S;
++        down_qtype    = QType::Q5G64_F16S;
++        break;
++    case WeightsProfile::FoldedTernary:
++        // 折叠三元的 SwiGLU gate/up 父权重被整体投影（2 * intermediate 行），down 投影折进
++        // 残差，两条路线都是 128 宽组几何的三元格式。
++        gate_up_qtype = QType::PQ2_0_G128;
++        down_qtype    = QType::PQ2_0_G128;
+         break;
+     default:
+         throw std::invalid_argument("qwen3_6_27b: invalid weights profile");
+     }
+-    const QType gate_up_qtype = QType::Q4G64_F16S;
+-    const QType down_qtype    = QType::Q5G64_F16S;
+     const ops::LinearPolicy policy = ops::LinearPolicy::A16Only;
+ 
+     WorkspaceLayoutBuilder layout;
+--- a/tests/targets/qwen3_6_27b/test_load_plan.cpp
++++ b/tests/targets/qwen3_6_27b/test_load_plan.cpp
+@@ -5,6 +5,7 @@
+ 
+ #include <ninfer/targets/qwen3_6_27b/package.h>
+ 
++#include <algorithm>
+ #include <bit>
+ #include <cmath>
+ #include <cstdlib>
+--- a/tools/artifact/__init__.py
++++ b/tools/artifact/__init__.py
+@@ -22,6 +22,7 @@
+     Layout,
+     RowPlanes,
+     RowSplitGeometry,
++    TernaryFormat,
+     assemble_row_planes,
+     decode_direct,
+     decode_row_split_codes,
+@@ -40,14 +41,18 @@
+     FP32,
+     I32,
+     NUMERIC_FORMATS,
++    PQ2_0_G128,
++    PTQ1_0_G128,
+     Q4G64_F16S,
+     Q5G64_F16S,
+     Q6G64_F16S,
+     QUANT_FORMATS,
++    TERNARY_FORMATS,
+     W8G32_F16S,
+     DirectFormat,
+     NumericFormat,
+     QuantFormat,
++    TernaryFormat,
+     get_format,
+ )
+ 
+@@ -68,12 +73,16 @@
+     "MAGIC",
+     "NUMERIC_FORMATS",
+     "NumericFormat",
++    "PQ2_0_G128",
++    "PTQ1_0_G128",
+     "Q4G64_F16S",
+     "Q5G64_F16S",
+     "Q6G64_F16S",
+     "QUANT_FORMATS",
+     "QuantFormat",
+     "ROW_SPLIT_K128_V1",
++    "TERNARY_FORMATS",
++    "TernaryFormat",
+     "ResourceObject",
+     "ResourceSpec",
+     "RowPlanes",
+--- a/tools/artifact/layouts.py
++++ b/tools/artifact/layouts.py
+@@ -22,6 +22,7 @@
+     DirectFormat,
+     NumericFormat,
+     QuantFormat,
++    TernaryFormat,
+     valid_positive_fp32_word,
+     get_format,
+ )
+@@ -79,7 +80,17 @@
+ ROW_SPLIT_K128_V1 = Layout(
+     "row-split-k128-v1",
+     256,
+-    frozenset(("Q4G64_F16S", "Q5G64_F16S", "Q6G64_F16S", "W8G32_F16S")),
++    frozenset(
++        (
++            "Q4G64_F16S",
++            "Q5G64_F16S",
++            "Q6G64_F16S",
++            "W8G32_F16S",
++            # 三元格式共用同一个容器布局，只是组几何与码打包不同。
++            "PTQ1_0_G128",
++            "PQ2_0_G128",
++        )
++    ),
+ )
+ 
+ LAYOUTS = MappingProxyType(
+@@ -146,15 +157,20 @@
+     format: str | QuantFormat, shape: Sequence[int]
+ ) -> RowSplitGeometry:
+     spec = _format(format)
+-    if not isinstance(spec, QuantFormat):
++    if isinstance(spec, TernaryFormat):
++        # 显式携带每组平面字节数，不从位宽反推（见 numeric.TernaryFormat）。
++        base_bytes_per_group = spec.base_bytes_per_group
++        high_bytes_per_group = spec.high_bytes_per_group
++    elif isinstance(spec, QuantFormat):
++        base_bytes_per_group = spec.group_size if spec.bits == 8 else spec.group_size // 2
++        high_bytes_per_group = (
++            0 if spec.bits in (4, 8) else spec.group_size * (spec.bits - 4) // 8
++        )
++    else:
+         raise ValueError("row-split-k128-v1 requires a grouped quantized format")
+     n, k = _shape(shape, rank=2)
+     k_pad = align_up(k, K_ALIGNMENT)
+     groups_per_row = k_pad // spec.group_size
+-    base_bytes_per_group = spec.group_size if spec.bits == 8 else spec.group_size // 2
+-    high_bytes_per_group = (
+-        0 if spec.bits in (4, 8) else spec.group_size * (spec.bits - 4) // 8
+-    )
+     base_row_bytes = groups_per_row * base_bytes_per_group
+     high_row_bytes = groups_per_row * high_bytes_per_group
+     scale_row_bytes = groups_per_row * 2
+@@ -202,7 +218,7 @@
+             raise ValueError("contiguous-le-v1 supports rank 0 through 16")
+         return prod(dims) * numeric_spec.word_bytes
+     if layout_spec is ROW_SPLIT_K128_V1:
+-        if not isinstance(numeric_spec, QuantFormat):
++        if not isinstance(numeric_spec, (QuantFormat, TernaryFormat)):
+             raise ValueError("row-split-k128-v1 requires a grouped quantized format")
+         return row_split_geometry(numeric_spec, shape).payload_bytes
+     raise ValueError(f"unsupported tensor layout: {layout_spec.name!r}")
+@@ -352,6 +368,14 @@
+     """
+ 
+     spec = _format(format)
++    if isinstance(spec, TernaryFormat):
++        # 三元平面不是"低半字节 + 高位比特"的通用打包：PTQ1_0 是 5 个三值/字节的 base-3
++        # 编码，PQ2_0 是 4 个 2-bit 码/字节。它们由三元打包器
++        # （tools/pack.py 的 assemble_ternary）装配，这里不做第二份实现，以免两处漂移。
++        raise ValueError(
++            f"{spec.name} 的平面装配由三元打包器负责（tools/pack.py），"
++            "通用 encode_row_split 不支持该格式"
++        )
+     if not isinstance(spec, QuantFormat):
+         raise ValueError("row-split encoding requires a grouped quantized format")
+     geometry = row_split_geometry(spec, shape)
+@@ -660,6 +684,12 @@
+     """
+ 
+     spec = _format(format)
++    if isinstance(spec, TernaryFormat):
++        # 三元的码解码只有一份实现：三元打包器 tools/pack.py（以及供验证脚本复用的
++        # tools/ternary_ref.py）。这里刻意不做第二份，以免两处漂移。
++        raise ValueError(
++            f"{spec.name} 的码解码请使用三元参考实现（tools/ternary_ref.py）"
++        )
+     if not isinstance(spec, QuantFormat):
+         raise ValueError("row-split decoding requires a grouped quantized format")
+     geometry = row_split_geometry(spec, shape)
+@@ -738,6 +768,11 @@
+     """Reconstruct a logical ``[N,K]`` tensor from a row-split payload."""
+ 
+     spec = _format(format)
++    if isinstance(spec, TernaryFormat):
++        # 见 decode_row_split_codes：三元的解码只有 tools/ternary_ref.py 一份实现。
++        raise ValueError(
++            f"{spec.name} 的反量化请使用三元参考实现（tools/ternary_ref.py）"
++        )
+     if not isinstance(spec, QuantFormat):
+         raise ValueError("row-split dequantization requires a grouped quantized format")
+     if not dtype.is_floating_point:
+@@ -777,6 +812,7 @@
+     "ROW_SPLIT_K128_V1",
+     "RowPlanes",
+     "RowSplitGeometry",
++    "TernaryFormat",
+     "align_up",
+     "assemble_row_planes",
+     "decode_direct",
+--- a/tools/artifact/numeric.py
++++ b/tools/artifact/numeric.py
+@@ -28,7 +28,23 @@
+     qmax: int
+ 
+ 
+-NumericFormat: TypeAlias = DirectFormat | QuantFormat
++@dataclass(frozen=True, slots=True)
++class TernaryFormat:
++    """三值权重：base-3 三值码或 2-bit 码，每组一个 binary16 缩放。
++
++    与 QuantFormat 的区别在于"每组多少字节"无法由位宽推出：Prism 三元用 128 宽的组，
++    PTQ1_0 的基础平面是 24 B 且额外带 2 B 高位平面（5 个三值/字节，装不满整字节），
++    PQ2_0 的基础平面是 32 B 且没有高位平面（4 个 2-bit 码/字节）。所以这里直接携带
++    每组的平面字节数，而不是从 bits 反推。
++    """
++
++    name: str
++    group_size: int
++    base_bytes_per_group: int
++    high_bytes_per_group: int
++
++
++NumericFormat: TypeAlias = DirectFormat | QuantFormat | TernaryFormat
+ 
+ 
+ BF16 = DirectFormat("BF16", 2)
+@@ -40,6 +56,11 @@
+ Q6G64_F16S = QuantFormat("Q6G64_F16S", 6, 64, -32, 31)
+ W8G32_F16S = QuantFormat("W8G32_F16S", 8, 32, -127, 127)
+ 
++# Prism 私有三元（Ternary Bonsai 2 27B）。几何与引擎侧 artifact/storage_layouts.cpp 的
++# quant_geometry() 必须逐字节一致：PTQ1_0 = 24 + 2，PQ2_0 = 32 + 0（每组 128 个权重）。
++PTQ1_0_G128 = TernaryFormat("PTQ1_0_G128", 128, 24, 2)
++PQ2_0_G128 = TernaryFormat("PQ2_0_G128", 128, 32, 0)
++
+ 
+ DIRECT_FORMATS = MappingProxyType(
+     {item.name: item for item in (BF16, FP32, I32)}
+@@ -50,8 +71,11 @@
+         for item in (Q4G64_F16S, Q5G64_F16S, Q6G64_F16S, W8G32_F16S)
+     }
+ )
++TERNARY_FORMATS = MappingProxyType(
++    {item.name: item for item in (PTQ1_0_G128, PQ2_0_G128)}
++)
+ NUMERIC_FORMATS = MappingProxyType(
+-    {**DIRECT_FORMATS, **QUANT_FORMATS}
++    {**DIRECT_FORMATS, **QUANT_FORMATS, **TERNARY_FORMATS}
+ )
+ 
+ 
+@@ -81,11 +105,15 @@
+     "I32",
+     "NUMERIC_FORMATS",
+     "NumericFormat",
++    "PQ2_0_G128",
++    "PTQ1_0_G128",
+     "Q4G64_F16S",
+     "Q5G64_F16S",
+     "Q6G64_F16S",
+     "QUANT_FORMATS",
+     "QuantFormat",
++    "TERNARY_FORMATS",
++    "TernaryFormat",
+     "W8G32_F16S",
+     "get_format",
+     "valid_positive_fp32_word",

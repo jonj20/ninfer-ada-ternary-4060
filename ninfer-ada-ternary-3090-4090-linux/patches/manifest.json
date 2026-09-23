@@ -1,0 +1,287 @@
+{
+  "target": {
+    "repository": "https://github.com/UDPSendToFailed/ninfer-4090.git",
+    "commit": "5c60b7c9b455231795c09da21a9fbb6aa53f08e5",
+    "description": "ninfer-4090 v1.2.0 线（支持 sm_86 / sm_89，支持 Linux）"
+  },
+  "port": {
+    "source_repository": "https://www.modelscope.cn/shensanshu/ninfer-ada-ternary.git",
+    "source_revision": "ca845a4 (pack.py: reject a non-groupwise-int template up front)",
+    "source_baseline": "Ambolio/ninfer-4090-windows @ 6eb70a07 (v1.0.8-windows, Ada sm_89)"
+  },
+  "file_count": 45,
+  "added_count": 14,
+  "modified_count": 31,
+  "files": [
+    {
+      "path": "include/ninfer/ops/attn_input_proj.h",
+      "sha256": "41a28f53fd441c412704efe8cc93ed7897b76df580d8871854a598ccf361c358",
+      "status": "modified",
+      "sha256_upstream": "02d31dd85dc19091732779ee2ba591a0e474319de50c38bf79159487acd99427"
+    },
+    {
+      "path": "include/ninfer/ops/gdn_input_proj.h",
+      "sha256": "00d9dc3401c98d56a5db9468ecaa63d951d96728c46d536db7206de603b32817",
+      "status": "modified",
+      "sha256_upstream": "c158b24cd80bad5ff34906319f11f4d18a67e064c556fcf90ebedf8ed92f6bf1"
+    },
+    {
+      "path": "src/CMakeLists.txt",
+      "sha256": "792a23548724909f3f5b656830d3c97a69d31e5709aedb8b8c5b18336a00b2a8",
+      "status": "modified",
+      "sha256_upstream": "2feacdd01304d5d0743fb2bd1c12b8106b556576ce798135eb963fc0ce84e58b"
+    },
+    {
+      "path": "src/artifact/binder.cpp",
+      "sha256": "654f1a0e4cb75f7c46269f9fe4e19fba12d506e6b79513496193b32fd50f8812",
+      "status": "modified",
+      "sha256_upstream": "aa143207ace54a76ca3a3fca960c124b95b63d013283a2d9b703ffcde053d696"
+    },
+    {
+      "path": "src/artifact/binder.h",
+      "sha256": "1bf79ff9630e0b1a831eb849f3f7e0c3367662b53597a23616801889c399f626",
+      "status": "modified",
+      "sha256_upstream": "c9eb72df5ca982e6e17275e269e4315e487ba43e9f1a210c0a5b7940266fea98"
+    },
+    {
+      "path": "src/artifact/reader.cpp",
+      "sha256": "4debb939628036e9e060179f9ecefa7d83c689c512de01070a80ec55bf54b0b3",
+      "status": "modified",
+      "sha256_upstream": "eea96e902a590658b4a80b25e3ef7bbd7a15d685549f99aa6011b090b9f592fe"
+    },
+    {
+      "path": "src/artifact/reader.h",
+      "sha256": "6b07d056209e1b779a0ce1fe0c572c3790f6a552129ddb87bf2ed7833b034d5d",
+      "status": "modified",
+      "sha256_upstream": "53c6c7657edfd625d93d5cc5c18bef9b10682929233a3ab42e92f32882866dae"
+    },
+    {
+      "path": "src/artifact/storage_layouts.cpp",
+      "sha256": "7f7a154707933e0af68afd6b9d95dea02a82ae269e185d4eed75c4c47338fbcd",
+      "status": "modified",
+      "sha256_upstream": "d22f0fae256649206cd367535f0db8019fcff04e8959b4cbe9b9462b4ebe97ec"
+    },
+    {
+      "path": "src/artifact/typed_binding.cpp",
+      "sha256": "fdd868852f364acad08c5b3fe21e00f2ac62a5d9d929ce0dfedde49a4ea76dfb",
+      "status": "modified",
+      "sha256_upstream": "70d8a433d82b8e717b9ebd8b6b068c7e262982005f7a592a4f73f8e0068ab430"
+    },
+    {
+      "path": "src/core/tensor.h",
+      "sha256": "fa1845009d12660797be029fc8fd03b89ce73436a27a660d076cbfd9c8a6cda9",
+      "status": "modified",
+      "sha256_upstream": "9940604fa8dea9613701d85d3327ee27f2a0afea7db5e6376057c3904468ae2b"
+    },
+    {
+      "path": "src/ops/kernel/embed_gather.cuh",
+      "sha256": "daae454b1434f1a05a23abe64cd0bd202b4c42b39eb13115d3fd94529f005b7d",
+      "status": "modified",
+      "sha256_upstream": "b61b77c7bed1439c3a9d45cd0314c5a1068b828edc06676248d6810c059411a2"
+    },
+    {
+      "path": "src/ops/kv_cache/hadamard_d256.cuh",
+      "sha256": "3d00813a0a3c112484ef5a12c0011ec7ee8d0848aa17fadccaf9fbdeb0b14fa7",
+      "status": "added",
+      "sha256_upstream": null
+    },
+    {
+      "path": "src/ops/launcher/embed_gather.cu",
+      "sha256": "00241dc0e092d0299d8647262d0b685e9dab5fae4f329a6620b93a91554172a6",
+      "status": "modified",
+      "sha256_upstream": "ffdfd588a28db7c239056e8bda20d6691e274f5cad62c845a0e0834f5fc63c58"
+    },
+    {
+      "path": "src/ops/launcher/embed_gather.h",
+      "sha256": "5fd5160de8cb8451eabdcf5a14cd9bbb576cef4f395e354a2cb6084cac02d3d6",
+      "status": "modified",
+      "sha256_upstream": "35954562fa013d13d06a4e21b73d509f6863925c117f93295343280223191316"
+    },
+    {
+      "path": "src/ops/linear/linear.cpp",
+      "sha256": "55e6f1a1c52910cbe1459bd45389ea9500efd9ef1d964c9e819cb7403db5dcc4",
+      "status": "modified",
+      "sha256_upstream": "cf45be2b09986355812621f0b9d3232eadb1ecbdabbf36edccc0ee88e472ca33"
+    },
+    {
+      "path": "src/ops/linear/ternary/ternary_dispatch.cpp",
+      "sha256": "915936699445a234b7bd69238fdcefd466709fcdfe481764331dea62191dbd6d",
+      "status": "added",
+      "sha256_upstream": null
+    },
+    {
+      "path": "src/ops/linear/ternary/ternary_dispatch.h",
+      "sha256": "e3c4d1b5bfbe0adbdc8bc5014c79af6e9e6e85381cd3c99c2fb7460d3f982edc",
+      "status": "added",
+      "sha256_upstream": null
+    },
+    {
+      "path": "src/ops/linear/ternary/ternary_launch.h",
+      "sha256": "b6d510e7f139aa3aa15457272e7c231f1be177511a26672e7f9ecc52bd25eae9",
+      "status": "added",
+      "sha256_upstream": null
+    },
+    {
+      "path": "src/ops/linear/ternary/ternary_rotation.cpp",
+      "sha256": "2e3ca9c17fefc8d93d48d33c086e68251f021f18b41630cf6efabdcf9c8d4bd1",
+      "status": "added",
+      "sha256_upstream": null
+    },
+    {
+      "path": "src/ops/linear/ternary/ternary_rotation.cu",
+      "sha256": "9c1ff6e0413f04899e4883cbc54f0170a563e293dc7cef1283f4505556a10ea1",
+      "status": "added",
+      "sha256_upstream": null
+    },
+    {
+      "path": "src/ops/linear/ternary/ternary_rotation.h",
+      "sha256": "44711e9905aa983f93c1fffd5137a0bb6946bac00ec63eea38906d36e06d3665",
+      "status": "added",
+      "sha256_upstream": null
+    },
+    {
+      "path": "src/ops/linear/ternary/ternary_rotation_kernels.cuh",
+      "sha256": "1a5d71b6300c24b11fcb4953e57c2b714dfc20afbf03ef5787427b4f55d4694e",
+      "status": "added",
+      "sha256_upstream": null
+    },
+    {
+      "path": "src/ops/linear/ternary/ternary_row_view.h",
+      "sha256": "d77be04e94f688c8664b14b95f8541f1852adb1102e5e65c4703dbda48be6781",
+      "status": "added",
+      "sha256_upstream": null
+    },
+    {
+      "path": "src/ops/linear/ternary/ternary_rowsplit_gemm.cu",
+      "sha256": "309388d05bc756965cdaba160fd8c0151e2c0c9b634af70666117e647a329666",
+      "status": "added",
+      "sha256_upstream": null
+    },
+    {
+      "path": "src/ops/linear/ternary/ternary_rowsplit_gemm.cuh",
+      "sha256": "10b2df1b4a3b1455faba36a2cdbc91bc1cf698499f2d7be97e0135624ee60a84",
+      "status": "added",
+      "sha256_upstream": null
+    },
+    {
+      "path": "src/ops/linear/ternary/ternary_rowsplit_gemv.cuh",
+      "sha256": "b20ab43757053e9917f3bafe46db0edf8075192b2a142154671bb9fb18ee664c",
+      "status": "added",
+      "sha256_upstream": null
+    },
+    {
+      "path": "src/ops/linear/ternary/ternary_rowsplit_mma_small_t.cuh",
+      "sha256": "7747b2320c1397d1425495217408b01ef8c98f8a7af54841348bae192fbf3fda",
+      "status": "added",
+      "sha256_upstream": null
+    },
+    {
+      "path": "src/ops/linear/ternary/ternary_rowsplit_storage.cuh",
+      "sha256": "37a37fc44aaab98c46a85497d5284167b4d66315946768d1c69ed605a6249738",
+      "status": "added",
+      "sha256_upstream": null
+    },
+    {
+      "path": "src/ops/wrapper/attn_input_proj.cpp",
+      "sha256": "983bdd7ec162d30fe4883de175e7398a59221b2c0f5b332419e8ed718df6184e",
+      "status": "modified",
+      "sha256_upstream": "5f8345ca7069a9fa2ec4e66d1d5e90cd6566be328c574a8bcdaf12160204f4c4"
+    },
+    {
+      "path": "src/ops/wrapper/embedding.cpp",
+      "sha256": "6dab6212578434ecca913a8bf4f41475aa7471ea8f0e75d1e9f48c432e9f7195",
+      "status": "modified",
+      "sha256_upstream": "65a9c6bb947c4799951da6ae160a27a53bb8e0ec48ea1bc4b9c11dc32431a13b"
+    },
+    {
+      "path": "src/ops/wrapper/gdn_input_proj.cpp",
+      "sha256": "5820d1613e848a8701e360b7942728bd682e7b62242f78df29c5b91296bd4c56",
+      "status": "modified",
+      "sha256_upstream": "2eba52afb2deec37a3beb9b3162be9349ff083b3547e6d35c18030a6aa89e4e5"
+    },
+    {
+      "path": "src/ops/wrapper/linear_add.cpp",
+      "sha256": "333ed120d049e4f03d5e0d94d411ca2298757c1cb55cb9c890b20f23d906a74b",
+      "status": "modified",
+      "sha256_upstream": "910aed03ce1386ff5e8e20f2ac6f4a5aa68e86c429bad99686ab5fb742394051"
+    },
+    {
+      "path": "src/ops/wrapper/linear_swiglu.cpp",
+      "sha256": "e94495e76ba757df13946008c7a0cbc1dd84ffb48f298c1ccd3e69e704c588d5",
+      "status": "modified",
+      "sha256_upstream": "72bbf3a488b7ea8a0c434bd9f16a050c78bd206f45fa6e51a9e7cdc21c81ae6a"
+    },
+    {
+      "path": "src/targets/qwen3_6/impl/runtime/dflash_impl.h",
+      "sha256": "888815dc8d3e88b37a82a0d46b68f389ee4999bd43fd75ee3a8ea5202e9efc7c",
+      "status": "modified",
+      "sha256_upstream": "060aaa756728acd90ba6a1ad11f45024d2e032e00abfbb75b2da884011ea4514"
+    },
+    {
+      "path": "src/targets/qwen3_6/impl/runtime/text_context_impl.h",
+      "sha256": "eb8484d1f8f93aef738031181dd1bd0095548c7cccfab6038bddac9a2f88e087",
+      "status": "modified",
+      "sha256_upstream": "732e3305f8ddc82165a0a2718740bc9a4ecef6ec51fc2b691a6a384f2093340b"
+    },
+    {
+      "path": "src/targets/qwen3_6/impl/runtime/text_prefill_impl.h",
+      "sha256": "74cb50d5ee8dbbdd77fac84fc89397b6d152788fee12d529859c2c138d15368c",
+      "status": "modified",
+      "sha256_upstream": "90af7982934d7fc20a7e97b036e28eb40a7214902c77a6f1d33c60473c612534"
+    },
+    {
+      "path": "src/targets/qwen3_6_27b/export/ninfer/targets/qwen3_6_27b/package.h",
+      "sha256": "6ff356053ccd2ce25afadc67d02ce6d156c45d11704d762e52bffdb7e1b5c39f",
+      "status": "modified",
+      "sha256_upstream": "99c0ee2090c6f0b9f9cb4c5895dbc7769713e596f5850c0ca9bf876f2e632ab5"
+    },
+    {
+      "path": "src/targets/qwen3_6_27b/impl/load/bindings.cpp",
+      "sha256": "3e0453179c82f5a6705f619f8aaa3ba09d8803495192d2bd3778da5a2b9569cd",
+      "status": "modified",
+      "sha256_upstream": "57b2aeeb1c149bb8e1f53197c151a1e7b4a5d513957ef77a61e535949cc5eeed"
+    },
+    {
+      "path": "src/targets/qwen3_6_27b/impl/load/bindings.h",
+      "sha256": "fb7f632f5ef16102a81c78096ee778ff37e3ae57dc1bae8924f1659b852991d0",
+      "status": "modified",
+      "sha256_upstream": "a7168bf9604fee2498bdb2f22b769b8286b5140b55d0335a0b21c2e48e2290f1"
+    },
+    {
+      "path": "src/targets/qwen3_6_27b/impl/package.cpp",
+      "sha256": "a1a7884ee043827ee7a23eef780afbdb3e3fc8103db75701a33d53a21140047f",
+      "status": "modified",
+      "sha256_upstream": "537ebffb7c5f1c57df71488dcb168098fd3dd8d375a9407c4303120c2aabc244"
+    },
+    {
+      "path": "src/targets/qwen3_6_27b/impl/variant.cpp",
+      "sha256": "edd890ea88e0bd66f8dd9511adb5fc3bcffe8c03388b3ed4116e2e415f18127f",
+      "status": "modified",
+      "sha256_upstream": "55f291f88a4743d586fb4ac2480941bf8b8969a925a15ad69a5c717d318a1e6e"
+    },
+    {
+      "path": "tests/targets/qwen3_6_27b/test_load_plan.cpp",
+      "sha256": "4b483f8e9641b2d7d3c1ce8508ab3029c4a19c989e36f373076b1e38a264cab9",
+      "status": "modified",
+      "sha256_upstream": "1a21e56fe3b1fe156cfd399967726aebf9a0de553899b72c296e9502d46a4eea"
+    },
+    {
+      "path": "tools/artifact/__init__.py",
+      "sha256": "ee0cde6b0db6fdc0c89f1ed3882109786f24a584d371981f1c5e0e65fa842014",
+      "status": "modified",
+      "sha256_upstream": "d51f454ba53102b930badb616eb50a1d6c99c4791ca16fdd475f337bab9228fe"
+    },
+    {
+      "path": "tools/artifact/layouts.py",
+      "sha256": "49dff4d7d3e18998d5f87b5b7747eb47b7f9648d32c519fbd48623811f7ee9b8",
+      "status": "modified",
+      "sha256_upstream": "7a7ed0f252b6cffcf3cced9494ef85cda4f78557e00cf2de53150a04c6cdf5d9"
+    },
+    {
+      "path": "tools/artifact/numeric.py",
+      "sha256": "05f8d4a5fb267f91ea8d8654afb52d6b3f14d6b84d64c6caf020c84547ffdeb1",
+      "status": "modified",
+      "sha256_upstream": "61bd15848b1af2e9ff73e290d7d0224fb295b81fa9685c6aa49accfeaa97855c"
+    }
+  ]
+}

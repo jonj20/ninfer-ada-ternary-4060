@@ -1,0 +1,101 @@
+#pragma once
+
+#include "core/tensor.h"
+#include "ninfer/ops/linear.h"
+
+#include <cuda_runtime.h>
+
+#include <cstddef>
+#include <cstdint>
+
+namespace ninfer::ops {
+
+/**
+ * Computes four independent linear projections for each token:
+ *
+ *   q[:,t]    = linear(x[:,t], query_key_weight[0:6144,:])
+ *   k[:,t]    = linear(x[:,t], query_key_weight[6144:7168,:])
+ *   gate[:,t] = linear(x[:,t], gate_value_weight[0:6144,:])
+ *   v[:,t]    = linear(x[:,t], gate_value_weight[6144:7168,:]).
+ *
+ * All tensors are contiguous BF16. Shapes are x [5120,T], q/gate [6144,T], and k/v [1024,T].
+ * T may be any positive value.
+ * The two parent weights are RowSplit [7168,5120] with FP16 scales and group size 64:
+ * query_key is Q4G64_F16S and gate_value is Q5G64_F16S. The oracle exact-decodes each row and
+ * evaluates every projection naively in FP64 from the represented inputs. The BF16 outputs are
+ * promoted and compared directly with those ideal values; final output storage rounding belongs
+ * to AttnInputProj's named A16 criterion, not the oracle. Production routes choose their private
+ * accumulator and staging precision. Inputs and the four outputs must be mutually non-overlapping.
+ * Current registered routes require no transient allocation. The Op has no persistent state side
+ * effect.
+ */
+void attn_input_proj(const Tensor& x, const Weight& query_key_weight,
+                     const Weight& gate_value_weight, Tensor& q, Tensor& gate, Tensor& k, Tensor& v,
+                     cudaStream_t stream);
+
+/**
+ * 带显式工作区的双父权重注意力输入投影，语义与上面的重载相同。
+ *
+ * 折叠（旋转基）三元父权重 PTQ1_0_G128 / PQ2_0_G128 RowSplit `[7168,5120]` 只在这里被接纳：
+ * 它们的激活必须先映射进旋转基再做矩阵乘，而这块 scratch 只能来自工作区。四个投影共用同一次
+ * 旋转，所以每次调用只付一次，而不是每个父权重一次。
+ *
+ * Workspace:
+ *   父权重为折叠格式时为 `[5120, T]` 的 BF16 旋转缓冲；否则为零字节。
+ */
+void attn_input_proj(const Tensor& x, const Weight& query_key_weight,
+                     const Weight& gate_value_weight, Tensor& q, Tensor& gate, Tensor& k, Tensor& v,
+                     WorkspaceArena& workspace, cudaStream_t stream);
+
+/**
+ * Computes the single-parent Q/K/output-gate/V projection.
+ *
+ * The parent stores rows in physical order query, key, output gate, value while the public output
+ * argument order is q, gate, k, v. Every route writes the four independently contiguous final
+ * allocations directly; no packed parent output is materialized.
+ *
+ * Registered parent forms are:
+ *
+ * - W8G32_F16S RowSplit `[9216,2048]`, with row counts `[4096,512,4096,512]`. `x` is
+ *   BF16 `[2048,T]`, q/gate are BF16 `[4096,T]`, and k/v are BF16 `[512,T]`.
+ * - BF16_CTRL Contiguous `[14336,5120]`, with row counts `[6144,1024,6144,1024]`. `x` is
+ *   BF16 `[5120,T]`, q/gate are BF16 `[6144,T]`, and k/v are BF16 `[1024,T]`.
+ *
+ * `T` is the positive token extent of the Op contract. BF16_CTRL and W8G32_F16S admit only
+ * LinearPolicy::A16Only.
+ *
+ * The oracle evaluates every projection independently with naive FP64 accumulation from the
+ * logical values represented by the persistent weight and BF16 activation. The final four BF16
+ * stores belong to the Op's criterion for the selected activation-compute path.
+ *
+ * `workspace` is caller-owned call-scoped transient storage sized by
+ * attn_input_proj_workspace_capacity_bytes(). It must not overlap the input, parent weight, or any
+ * output. The Op does not allocate device memory internally.
+ */
+[[nodiscard]] std::size_t
+attn_input_proj_workspace_capacity_bytes(QType parent_qtype, std::int32_t parent_rows,
+                                         std::int32_t input_rows, LinearPolicy policy,
+                                         std::int32_t min_tokens, std::int32_t max_tokens);
+
+void attn_input_proj(const Tensor& x, const Weight& query_key_gate_value_weight, Tensor& q,
+                     Tensor& gate, Tensor& k, Tensor& v, LinearPolicy policy,
+                     WorkspaceArena& workspace, cudaStream_t stream);
+
+/**
+ * Applies the A16-only single-parent Q/K/output-gate/V projection without transient workspace.
+ */
+void attn_input_proj(const Tensor& x, const Weight& query_key_gate_value_weight, Tensor& q,
+                     Tensor& gate, Tensor& k, Tensor& v, cudaStream_t stream);
+
+/**
+ * Qwen3.6 companion W8 specialization. The W8G32_F16S RowSplit parent has shape [6144,2048]
+ * and stored row order [query 4096, key 1024, value 1024]. `x` is contiguous BF16 [2048,T],
+ * q is contiguous BF16 [4096,T], and k/v are contiguous BF16 [1024,T]. Every route writes
+ * the three independent final allocations directly; no parent output or transient workspace
+ * is materialized. T may be any positive value. Q and K remain raw projection outputs: this
+ * Op does not normalize or rotate either tensor.
+ */
+void attn_input_proj(const Tensor& x, const Weight& query_key_value_weight, Tensor& q, Tensor& k,
+                     Tensor& v, cudaStream_t stream);
+
+} // namespace ninfer::ops
