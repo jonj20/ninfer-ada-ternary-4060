@@ -60,23 +60,30 @@ MTP 投机本期不支持（8G 卡预留 924 MiB 不足）。
 
 | 项 | 实测 |
 |---|---|
-| **decode（当前默认）** | **15.3 tok/s**（15.26 / 15.33 / 15.36 三次；greedy / rk4v4-e8 / ctx2048 / 192 tok） |
+| **decode（当前默认）** | **17.6 tok/s**（17.55 / 17.59；greedy / rk4v4-e8 / ctx2048 / 192 tok） |
 | decode（bf16 激活回退） | **13.2 tok/s** |
 | decode（reference 解码回退） | **3.36 tok/s** |
 | prefill | **11.2 tok/s**（612 tok prompt） |
 | 参照：4090 PTQ1_0 | 15.8 tok/s decode |
-| 参照：llama.cpp 同机同文件 | **22–28 t/s**，差距 ≈ **×1.6**（优化前 ×7.4） |
+| 参照：llama.cpp 同机同文件 | **22–28 t/s**，差距 ≈ **×1.4**（优化前 ×7.4） |
 
-相对 reference 解码累计 **×4.55**。这一轮把根因定位为**指令发射率**而非访存模式：该卡实测可达
-**203 GB/s**，而原内核只有 47 GB/s——每个权重要付 1×FFMA + 1×int→float，且 128 列里 8 列的
-high 平面解码挤在热循环中（单独占 45%）。据此做了三件事：把 8 列 tail 移出热循环、
-把激活按 128 列组量化后用 `__dp4a` 一条指令算 4 个乘加、以及给 tail pass 加 unroll 隐藏延迟。
+相对 reference 解码累计 **×5.2**。这两轮把根因定位为**指令发射率**加上 **PTQ1_0 的三平面布局**：
+权重流单独能跑 223–230 GB/s（该卡可达上限 **249.6 GB/s**），而原内核只有 47 GB/s——每个权重要付
+1×FFMA + 1×int→float，且 128 列里 8 列的 high 平面解码挤在热循环中（单独占 45%）。据此做了四件事：
+把 8 列 tail 移出热循环并向量化、把激活按 128 列组量化后用 `__dp4a` 一条指令算 4 个乘加、
+以及 tail 装载与累加器拆分等微调。
+
+剩余差距的归属已量化（`tools/verify/ternary_gemv/pattern_attribution.cu`）：激活读取**免费**，
+但 high/scale 两条侧流 −22%、base-3 解码 −14%、dp4a 与 scale 累加 −29%。代价平摊、没有单一热点，
+所以再往上走需要**重打包权重布局**（三平面合一），而不是继续调内核。
 
 精度代价已量化：int8 激活使每行相对误差中位数 1.3%，全局幅度（RMS）保持 0.9%；
-`17 * 23` 正控、300 token 长生成、prefill 均无回归。实现、数值对拍与剩余空间见开发文档 §9.1。
+`17 * 23` 正控、300 token 长生成、prefill 均无回归。实现、数值对拍、已证伪方向与回归工具见
+[tools/verify/ternary_gemv/](tools/verify/ternary_gemv/) 与开发文档 §9.1。
 
-两条已证伪的路线（避免重复投入）：cp.async / shared-memory staging（实测 67–70 GB/s，
-因为瓶颈不是延迟隐藏），以及 kernel 内重复量化激活（量化本身约 25 指令/组，吃掉全部收益）。
+> 测带宽时注意：本机 SM 频率随电源状态摆动，单次计时有约 ±20% 噪声；用仓内
+> `tools/verify/ternary_gemv/gemv_bandwidth.cu`（5 次取 median），上限对照
+> `tools/hbm_bandwidth_probe.cu`。
 
 ---
 
