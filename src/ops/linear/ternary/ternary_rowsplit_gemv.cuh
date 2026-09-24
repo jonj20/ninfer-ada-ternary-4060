@@ -48,6 +48,17 @@ __device__ __forceinline__ float gemv_scale(const std::uint8_t* scale_ptr) {
     return __half2float(__ushort_as_half(bits));
 }
 
+// The four qh trits packed in one high byte, as weights in {-1, 0, 1}. Trit t sits at bit offset
+// 2t, so repeated multiplication by three walks them instead of four independent pow3 products.
+__device__ __forceinline__ void tail_trits4(std::uint32_t byte, float (&w)[4]) {
+    std::uint32_t q = byte & 0xFFu;
+#pragma unroll
+    for (int t = 0; t < 4; ++t) {
+        w[t] = static_cast<float>((q * 3u) >> 8) - 1.0f;
+        q = (q * 3u) & 0xFFu;
+    }
+}
+
 __global__ __launch_bounds__(kGemvWarpsPerBlock * 32)
 void ternary_pq2_gemv_kernel(const __nv_bfloat16* __restrict__ x,
                              const std::uint8_t* __restrict__ codes,
@@ -192,30 +203,39 @@ void ternary_ptq1_gemv_kernel(const __nv_bfloat16* __restrict__ x,
         // The 8 qh tail columns (120..127) live in the 2-byte high plane, not the code plane, so
         // they need a different decode. Folding that into the group loop costs ~45% of throughput
         // (measured 110 -> 57 GB/s on the gate_up shape: the kernel is instruction-issue bound, so
-        // every extra instruction in that loop costs directly). Instead each lane owns one tail
-        // column for a strided subset of groups: lane l handles column 120 + (l & 7) across groups
-        // (l >> 3), stride 4. The eight lanes sharing a group base cover that group's 8 columns, so
-        // every (group, tail column) pair is still visited exactly once, and the warp reduction
-        // sums both passes. Cost: ~5 instructions per 4 groups instead of ~15 per group.
+        // every extra instruction in that loop costs directly), so they get their own pass.
+        //
+        // Lane l owns whole groups l, l+32, ... and takes all 8 tail columns of a group at once:
+        // one 16-byte load covers the 8 activations, one 32-bit load covers the 2 high bytes and
+        // one covers the 2 scale bytes. That is 3 loads per group for the whole warp instead of the
+        // 3 scalar loads per group per lane a column-per-lane split needs (30 loads per lane for
+        // gpr=40). The warp reduction then sums every lane's partial, so each (group, column) pair
+        // is still visited exactly once.
         float acc_tail = 0.0f;
-        {
-            const int      tail_col  = lane & 7;
-            const int      tail_byte = tail_col & 1;
-            const unsigned tail_pow3 = ternary_pow3(tail_col >> 1);
-            const int      tail_act  = kGemvGroupK - 8 + tail_col;  // 120 + (l & 7)
-            // Unrolled on purpose: this loop is short and runs after the main loop, so without
-            // lookahead its three loads per iteration are fully exposed (measured 159 -> 87 GB/s on
-            // a 312 MB payload, i.e. the tail pass cost as much as 45% of the whole kernel).
-#pragma unroll 8
-            for (int group = lane >> 3; group < groups_per_row; group += 4) {
-                const std::uint8_t qb = static_cast<std::uint8_t>(
-                    high_row[group * 2 + tail_byte] * tail_pow3);
-                const float w = static_cast<float>(
-                    static_cast<int>((static_cast<std::uint16_t>(qb) * 3u) >> 8) - 1);
-                acc_tail = fmaf(gemv_scale(scale_row + group * kGemvScaleBytesPerGroup),
-                                w * static_cast<float>(__bfloat162float(x[group * kGemvGroupK + tail_act])),
-                                acc_tail);
-            }
+        for (int group = lane; group < groups_per_row; group += 32) {
+            // 16 bytes = 8 bf16, i.e. exactly the 8 tail columns; element 120 sits at byte 240
+            // within the group, so the 128-bit load is naturally aligned.
+            const uint4 av = *reinterpret_cast<const uint4*>(
+                x + group * kGemvGroupK + (kGemvGroupK - 8));
+            // 2-byte load: the high plane has a 2-byte group stride, so only 16-bit aligned.
+            const std::uint16_t hv =
+                *reinterpret_cast<const std::uint16_t*>(high_row + group * 2);
+            const float scale = gemv_scale(scale_row + group * kGemvScaleBytesPerGroup);
+
+            const __nv_bfloat162* ab = reinterpret_cast<const __nv_bfloat162*>(&av);
+            const float2 a0 = __bfloat1622float2(ab[0]);
+            const float2 a1 = __bfloat1622float2(ab[1]);
+            const float2 a2 = __bfloat1622float2(ab[2]);
+            const float2 a3 = __bfloat1622float2(ab[3]);
+            // trit t of a high byte is successive multiplication by 3: one chain gives all four.
+            float wb[4];
+            float wa[4];
+            tail_trits4(hv & 0xFFu, wb);
+            tail_trits4((hv >> 8) & 0xFFu, wa);
+            const float dot =
+                fmaf(wb[0], a0.x, fmaf(wa[0], a0.y, fmaf(wb[1], a1.x, fmaf(wa[1], a1.y,
+                fmaf(wb[2], a2.x, fmaf(wa[2], a2.y, fmaf(wb[3], a3.x, wa[3] * a3.y)))))));
+            acc_tail = fmaf(scale, dot, acc_tail);
         }
 
         float value = acc_front + acc_tail;
@@ -378,12 +398,10 @@ void ternary_ptq1_gemv_dp4a_kernel(const std::int8_t* __restrict__ xq,
             *reinterpret_cast<const int*>(xq + group * kGemvGroupK + lane * 4);
         const float a_scale = xq_scale[group];
 
-        std::uint32_t v_lo =
-            __byte_perm(*reinterpret_cast<const std::uint32_t*>(code_row + group * 24 + quad_off),
-                        0u, 0x4140u);
-        std::uint32_t v_hi =
-            __byte_perm(*reinterpret_cast<const std::uint32_t*>(code_row + group * 24 + quad_off),
-                        0u, 0x4342u);
+        const std::uint32_t code_word =
+            *reinterpret_cast<const std::uint32_t*>(code_row + group * 24 + quad_off);
+        std::uint32_t v_lo = __byte_perm(code_word, 0u, 0x4140u);
+        std::uint32_t v_hi = __byte_perm(code_word, 0u, 0x4342u);
         v_lo = (v_lo * pow3) & 0x00FF00FFu;
         v_hi = (v_hi * pow3) & 0x00FF00FFu;
         v_lo *= 3u;
@@ -397,23 +415,28 @@ void ternary_ptq1_gemv_dp4a_kernel(const std::int8_t* __restrict__ xq,
                          static_cast<float>(dot), acc_front);
     }
 
-    // qh tail pass, unchanged from the bf16 kernel: lane l owns tail column (l & 7) for groups
-    // (l >> 3) with stride 4, so the 8 columns leave the hot loop entirely.
+    // qh tail pass, same shape as the bf16 kernel: lane l owns whole groups l, l+32, ... and takes
+    // all 8 tail columns of a group with one 16-byte load, so the pass costs 3 loads per group for
+    // the warp instead of 3 per lane.
     float acc_tail = 0.0f;
-    {
-        const int      tail_col  = lane & 7;
-        const int      tail_byte = tail_col & 1;
-        const unsigned tail_pow3 = ternary_pow3(tail_col >> 1);
-        for (int group = lane >> 3; group < groups_per_row; group += 4) {
-            const std::uint8_t qb = static_cast<std::uint8_t>(
-                high_row[group * 2 + tail_byte] * tail_pow3);
-            const float w = static_cast<float>(
-                static_cast<int>((static_cast<std::uint16_t>(qb) * 3u) >> 8) - 1);
-            const int a = static_cast<int>(
-                xq[group * kGemvGroupK + kGemvGroupK - 8 + tail_col]);
-            acc_tail = fmaf(gemv_scale(scale_row + group * kGemvScaleBytesPerGroup) * xq_scale[group],
-                            w * static_cast<float>(a), acc_tail);
-        }
+    for (int group = lane; group < groups_per_row; group += 32) {
+        const uint4 av = *reinterpret_cast<const uint4*>(
+            xq + group * kGemvGroupK + (kGemvGroupK - 16));
+        const std::uint16_t hv =
+            *reinterpret_cast<const std::uint16_t*>(high_row + group * 2);
+        const float scale = gemv_scale(scale_row + group * kGemvScaleBytesPerGroup) *
+                            xq_scale[group];
+        const std::int8_t* ap = reinterpret_cast<const std::int8_t*>(&av) + 8;
+        float wb[4];
+        float wa[4];
+        tail_trits4(hv & 0xFFu, wb);
+        tail_trits4((hv >> 8) & 0xFFu, wa);
+        const float dot =
+            fmaf(wb[0], static_cast<float>(ap[0]), fmaf(wa[0], static_cast<float>(ap[1]),
+            fmaf(wb[1], static_cast<float>(ap[2]), fmaf(wa[1], static_cast<float>(ap[3]),
+            fmaf(wb[2], static_cast<float>(ap[4]), fmaf(wa[2], static_cast<float>(ap[5]),
+            fmaf(wb[3], static_cast<float>(ap[6]), wa[3] * static_cast<float>(ap[7]))))))));
+        acc_tail = fmaf(scale, dot, acc_tail);
     }
 
     float value = acc_front + acc_tail;
