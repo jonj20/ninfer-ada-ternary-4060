@@ -139,6 +139,23 @@ void run_shape(const Payload& p) {
     report("dp4a", p, dp4a, bytes);
     check(cudaGetLastError());
 
+    const int rec_unroll = (groups / 5 >= 4) ? 4 : ((groups / 5 >= 2) ? 2 : 1);
+    const Result rec = measure([&] {
+        ninfer::ops::detail::ternary_ptq1_quantize_act_kernel<<<1, 256>>>(dx, dq, dqs, groups);
+        if (rec_unroll == 4) {
+            ninfer::ops::detail::ternary_ptq1_gemv_recurrence_kernel<4>
+                <<<grid, kGemvWarpsPerBlock * 32>>>(dq, dqs, dc, dh, ds, dout, p.n, groups);
+        } else if (rec_unroll == 2) {
+            ninfer::ops::detail::ternary_ptq1_gemv_recurrence_kernel<2>
+                <<<grid, kGemvWarpsPerBlock * 32>>>(dq, dqs, dc, dh, ds, dout, p.n, groups);
+        } else {
+            ninfer::ops::detail::ternary_ptq1_gemv_recurrence_kernel<1>
+                <<<grid, kGemvWarpsPerBlock * 32>>>(dq, dqs, dc, dh, ds, dout, p.n, groups);
+        }
+    }, iters);
+    report("recurrence", p, rec, bytes);
+    check(cudaGetLastError());
+
     cudaFree(dx); cudaFree(dout); cudaFree(dc); cudaFree(dh); cudaFree(ds);
     cudaFree(dq); cudaFree(dqs);
 }

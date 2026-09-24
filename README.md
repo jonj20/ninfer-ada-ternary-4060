@@ -55,30 +55,33 @@ MTP 投机本期不支持（8G 卡预留 924 MiB 不足）。
 
 ### 性能基线（4060，PTQ1_0）
 
-> 2026-09-25 起 decode 走 **int8 激活 + `__dp4a` 整数点积**（默认开）。
-> 两级回退开关：`NINFER_TERNARY_PTQ1_DP4A=0` 退回 bf16 激活点积，`NINFER_TERNARY_PTQ1_GEMV=0` 退回 reference 解码。
+> 2026-09-25 起 decode 走 **int8 激活 + `__dp4a` 整数点积 + 三进制递推解码**（默认开）。
+> 三级回退开关：`NINFER_TERNARY_PTQ1_RECURRENCE=0` 退回每 lane 一个 trit 的 dp4a 内核，
+> `NINFER_TERNARY_PTQ1_DP4A=0` 退回 bf16 激活点积，`NINFER_TERNARY_PTQ1_GEMV=0` 退回 reference 解码。
 
 | 项 | 实测 |
 |---|---|
-| **decode（当前默认）** | **17.6 tok/s**（17.55 / 17.59；greedy / rk4v4-e8 / ctx2048 / 192 tok） |
+| **decode（当前默认）** | **22.6 tok/s**（22.60 / 22.63；greedy / rk4v4-e8 / ctx2048 / 192 tok） |
+| decode（递推解码回退） | **17.0 tok/s** |
 | decode（bf16 激活回退） | **13.2 tok/s** |
 | decode（reference 解码回退） | **3.36 tok/s** |
 | prefill | **11.2 tok/s**（612 tok prompt） |
 | 参照：4090 PTQ1_0 | 15.8 tok/s decode |
-| 参照：llama.cpp 同机同文件 | **22–28 t/s**，差距 ≈ **×1.4**（优化前 ×7.4） |
+| 参照：llama.cpp 同机同文件 | **22–28 t/s**，已收平到其下沿（优化前 ×7.4） |
 
-相对 reference 解码累计 **×5.2**。这两轮把根因定位为**指令发射率**加上 **PTQ1_0 的三平面布局**：
-权重流单独能跑 223–230 GB/s（该卡可达上限 **249.6 GB/s**），而原内核只有 47 GB/s——每个权重要付
-1×FFMA + 1×int→float，且 128 列里 8 列的 high 平面解码挤在热循环中（单独占 45%）。据此做了四件事：
-把 8 列 tail 移出热循环并向量化、把激活按 128 列组量化后用 `__dp4a` 一条指令算 4 个乘加、
-以及 tail 装载与累加器拆分等微调。
+相对 reference 解码累计 **×6.7**。根因是**每权重的指令数**，不是访存模式也不是权重布局：权重流单独
+能跑 223–230 GB/s（该卡可达上限 **249.6 GB/s**），而原内核只有 47 GB/s。为此做了四件事：把 8 列
+high 平面 tail 移出热循环并向量化、把激活按 128 列组量化后用 `__dp4a` 一条指令算 4 个乘加、
+按 llama.cpp 的三进制递推重排 lane→列映射（每 lane 一次吃掉一个 4 字节 span 的全部 5 个 trit，
+一次拓宽摊薄 5 倍）、以及 tail 装载与累加器拆分等微调。
 
-剩余差距的归属已量化（`tools/verify/ternary_gemv/pattern_attribution.cu`）：激活读取**免费**，
-但 high/scale 两条侧流 −22%、base-3 解码 −14%、dp4a 与 scale 累加 −29%。代价平摊、没有单一热点，
-所以再往上走需要**重打包权重布局**（三平面合一），而不是继续调内核。
+访存归因（`tools/verify/ternary_gemv/pattern_attribution.cu`）显示激活读取**免费**，剩余代价平摊在
+侧流 load、base-3 解码与累加上；**重打包权重布局已否证**（改成单平面交错后与三平面持平或更慢）。
 
 精度代价已量化：int8 激活使每行相对误差中位数 1.3%，全局幅度（RMS）保持 0.9%；
-`17 * 23` 正控、300 token 长生成、prefill 均无回归。实现、数值对拍、已证伪方向与回归工具见
+`17 * 23` 正控、300 token 长生成、prefill 均无回归。递推内核与原 dp4a 内核在 K=5120/1536/17408 上
+逐位一致（greedy 文本的末位差异来自 lane 归约分组改变导致的浮点重结合，与 int8 激活同类）。
+实现、数值对拍、已证伪方向与回归工具见
 [tools/verify/ternary_gemv/](tools/verify/ternary_gemv/) 与开发文档 §9.1。
 
 > 测带宽时注意：本机 SM 频率随电源状态摆动，单次计时有约 ±20% 噪声；用仓内

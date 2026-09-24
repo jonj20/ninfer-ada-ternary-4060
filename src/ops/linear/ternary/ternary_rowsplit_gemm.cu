@@ -99,6 +99,28 @@ void launch_pq2_gemv_tile(const Tensor& x, const Weight& w, Tensor& out,
     CUDA_CHECK(cudaGetLastError());
 }
 
+// NINFER_TERNARY_PTQ1_RECURRENCE=0 退回每 lane 一个 trit 的 dp4a 内核，用于与递推内核做端到端 A/B。
+[[nodiscard]] inline bool ternary_ptq1_recurrence_enabled() {
+    static const bool enabled = [] {
+        const char* value = std::getenv("NINFER_TERNARY_PTQ1_RECURRENCE");
+        return value == nullptr || std::string(value) != "0";
+    }();
+    return enabled;
+}
+
+// 主循环每次推进 5 组，可展开的次数取决于组数：展开 4 在 40 组（K=5120）形状上比展开 2 再快 3%，
+// 但 12 组（K=1536）形状上展开 4 反而回落，故按剩余迭代次数分档。
+template <int kUnroll>
+inline void launch_ptq1_recurrence(const std::int8_t* xq, const float* xq_scale,
+                                   const std::uint8_t* codes, const std::uint8_t* high,
+                                   const std::uint8_t* scales, __nv_bfloat16* out,
+                                   std::int32_t rows, std::int32_t groups_per_row,
+                                   unsigned grid, cudaStream_t stream) {
+    ninfer::ops::detail::ternary_ptq1_gemv_recurrence_kernel<kUnroll>
+        <<<grid, kGemvWarpsPerBlock * 32, 0, stream>>>(xq, xq_scale, codes, high, scales, out, rows,
+                                                       groups_per_row);
+}
+
 // Decode (T == 1) GEMV for PTQ1_0, the SIMD 4-trit path in ternary_rowsplit_gemv.cuh. Same
 // admission contract as the PQ2_0 GEMV: one token, K a whole number of 128-groups, and the padded
 // K staying at the real width so the no-guard read stays in-bounds. The reference kernel remains
@@ -115,10 +137,33 @@ void launch_ptq1_gemv(const Tensor& x, const Weight& w, Tensor& out, cudaStream_
             reinterpret_cast<float*>(q8_scratch() + kQ8ScratchMaxK);
         ternary_ptq1_quantize_act_kernel<<<1, 256, 0, stream>>>(
             static_cast<const __nv_bfloat16*>(x.data), xq, xq_scale, groups_per_row);
-        ternary_ptq1_gemv_dp4a_kernel<<<grid, kGemvWarpsPerBlock * 32, 0, stream>>>(
-            xq, xq_scale, static_cast<const std::uint8_t*>(w.qdata),
-            static_cast<const std::uint8_t*>(w.qhigh), static_cast<const std::uint8_t*>(w.scales),
-            static_cast<__nv_bfloat16*>(out.data), w.n, groups_per_row);
+        if (ternary_ptq1_recurrence_enabled()) {
+            const std::int32_t iters = groups_per_row / 5;
+            if (iters >= 4) {
+                launch_ptq1_recurrence<4>(xq, xq_scale, static_cast<const std::uint8_t*>(w.qdata),
+                                         static_cast<const std::uint8_t*>(w.qhigh),
+                                         static_cast<const std::uint8_t*>(w.scales),
+                                         static_cast<__nv_bfloat16*>(out.data), w.n,
+                                         groups_per_row, grid, stream);
+            } else if (iters >= 2) {
+                launch_ptq1_recurrence<2>(xq, xq_scale, static_cast<const std::uint8_t*>(w.qdata),
+                                         static_cast<const std::uint8_t*>(w.qhigh),
+                                         static_cast<const std::uint8_t*>(w.scales),
+                                         static_cast<__nv_bfloat16*>(out.data), w.n,
+                                         groups_per_row, grid, stream);
+            } else {
+                launch_ptq1_recurrence<1>(xq, xq_scale, static_cast<const std::uint8_t*>(w.qdata),
+                                         static_cast<const std::uint8_t*>(w.qhigh),
+                                         static_cast<const std::uint8_t*>(w.scales),
+                                         static_cast<__nv_bfloat16*>(out.data), w.n,
+                                         groups_per_row, grid, stream);
+            }
+        } else {
+            ternary_ptq1_gemv_dp4a_kernel<<<grid, kGemvWarpsPerBlock * 32, 0, stream>>>(
+                xq, xq_scale, static_cast<const std::uint8_t*>(w.qdata),
+                static_cast<const std::uint8_t*>(w.qhigh), static_cast<const std::uint8_t*>(w.scales),
+                static_cast<__nv_bfloat16*>(out.data), w.n, groups_per_row);
+        }
         CUDA_CHECK(cudaGetLastError());
         return;
     }

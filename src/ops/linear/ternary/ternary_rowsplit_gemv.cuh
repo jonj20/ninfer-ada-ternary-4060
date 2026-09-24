@@ -447,6 +447,137 @@ void ternary_ptq1_gemv_dp4a_kernel(const std::int8_t* __restrict__ xq,
     if (lane == 0) { out[warp] = __float2bfloat16_rn(value); }
 }
 
+// ---------------------------------------------------------------------------
+// PTQ1_0 decode GEMV：三进制递推解码（借鉴 llama.cpp vec_dot_ptq1_0_q8_1）。
+//
+// 为什么：上面的 dp4a 内核里 pow3 是每 lane 常量，一个 lane 只取一个 trit，于是两次 __byte_perm 拓宽的
+// 代价每 4 个权重就要付一次。llama.cpp 改成原地递推 v = (v * 3) & 0x00FF00FF，一次拓宽摊薄到同一
+// span 的全部 5 个 trit（20 个权重），并且 5 次 dp4a 先累进同一个 int32，最后只做一次 scale 乘法。
+// 递推第 t 步发出的是 ((a*3^t mod 256)*3)>>8，与 pow3=3^t 形式逐位相同，所以权重与激活完全不变。
+//
+// lane 映射：每 lane 领一个 4 字节 span 并一次吃完它的 5 个 trit。一组共 6 个 span（16 字节前区覆盖
+// 列 0..79，8 字节中区覆盖 80..119），qh 的 8 列仍走独立 tail pass。一次 warp 迭代覆盖 5 组，
+// 6*5 = 30 个 lane 参与；剩余 2 个 lane 复用第 29 号 lane 的 span 并用掩码清零贡献，从而把体内所有
+// 条件判断移到循环之外（体内分支会退化成 BSSY/BSYNC，代价约 2 倍）。
+//
+// 实测（RTX 4060，gate_up 312 MB 形状，权重读取带宽上限 249.6 GB/s）：110 -> 147 GB/s（unroll 4），
+// 且输出与 dp4a 内核逐位一致。
+template <int kUnroll>
+__global__ __launch_bounds__(kGemvWarpsPerBlock * 32)
+void ternary_ptq1_gemv_recurrence_kernel(const std::int8_t* __restrict__ xq,
+                                        const float* __restrict__ xq_scale,
+                                        const std::uint8_t* __restrict__ codes,
+                                        const std::uint8_t* __restrict__ high,
+                                        const std::uint8_t* __restrict__ scales,
+                                        __nv_bfloat16* __restrict__ out, std::int32_t rows,
+                                        std::int32_t groups_per_row) {
+    // 一组内的 span 数与每次迭代推进的组数：6 个 span 覆盖 120 列，5 组用满 30 个 lane。
+    constexpr int kSpansPerGroup = 6;
+    constexpr int kGroupsPerIter = 5;
+    constexpr int kTritsPerSpan  = 5;
+    constexpr int kBusyLanes      = kSpansPerGroup * kGroupsPerIter;
+
+    const int lane = static_cast<int>(threadIdx.x) & 31;
+    const int warp =
+        static_cast<int>(blockIdx.x) * kGemvWarpsPerBlock + (static_cast<int>(threadIdx.x) >> 5);
+    if (warp >= rows) { return; }
+
+    const std::uint8_t* code_row =
+        codes + static_cast<std::int64_t>(warp) * groups_per_row * 24;
+    const std::uint8_t* high_row =
+        high + static_cast<std::int64_t>(warp) * groups_per_row * 2;
+    const std::uint8_t* scale_row =
+        scales + static_cast<std::int64_t>(warp) * groups_per_row * 2;
+
+    const int slot  = (lane < kBusyLanes) ? lane : kBusyLanes - 1;
+    const int span  = slot % kSpansPerGroup;
+    const int gsub  = slot / kSpansPerGroup;
+    const std::uint32_t lane_mask = (lane < kBusyLanes) ? 0xFFFFFFFFu : 0u;
+    // 前区 span 落在字节 0..15、列步长 16；中区 span 落在字节 16..23、列步长 8。
+    const int byte_off = (span < 4) ? (span * 4) : (16 + (span - 4) * 4);
+    const int col_base = (span < 4) ? (span * 4) : (80 + (span - 4) * 4);
+    const int col_step = (span < 4) ? 16 : 8;
+
+    float acc_front = 0.0f;
+    const int iters  = groups_per_row / kGroupsPerIter;
+#pragma unroll kUnroll
+    for (int it = 0; it < iters; ++it) {
+        const int group = it * kGroupsPerIter + gsub;
+        const std::uint32_t code_word =
+            *reinterpret_cast<const std::uint32_t*>(code_row + group * 24 + byte_off);
+        std::uint32_t v_lo = __byte_perm(code_word, 0u, 0x4140u);
+        std::uint32_t v_hi = __byte_perm(code_word, 0u, 0x4342u);
+        int sumi = 0;
+#pragma unroll
+        for (int t = 0; t < kTritsPerSpan; ++t) {
+            // 掩码 0x00FF00FF 兼做进位隔离：截断后再乘 3，高字节即为该 trit。
+            const std::uint32_t w_lo = v_lo * 3u;
+            const std::uint32_t w_hi = v_hi * 3u;
+            v_lo = w_lo & 0x00FF00FFu;
+            v_hi = w_hi & 0x00FF00FFu;
+            const int q = __vsub4(__byte_perm(w_lo, w_hi, 0x7531u), 0x01010101u);
+            const int col = col_base + t * col_step;
+            const int a = *reinterpret_cast<const int*>(xq + group * kGemvGroupK + col);
+            sumi = __dp4a(q, a, sumi);
+        }
+        sumi &= static_cast<int>(lane_mask);
+        acc_front = fmaf(gemv_scale(scale_row + group * 2) * xq_scale[group],
+                         static_cast<float>(sumi), acc_front);
+    }
+
+    // 组数不是 5 的倍数时余数单独处理，该段在主循环之外，不影响主循环的分支自由。
+    for (int g0 = iters * kGroupsPerIter; g0 < groups_per_row; g0 += kGroupsPerIter) {
+        const int group = g0 + gsub;
+        if (lane >= kBusyLanes || group >= groups_per_row) { continue; }
+        const std::uint32_t code_word =
+            *reinterpret_cast<const std::uint32_t*>(code_row + group * 24 + byte_off);
+        std::uint32_t v_lo = __byte_perm(code_word, 0u, 0x4140u);
+        std::uint32_t v_hi = __byte_perm(code_word, 0u, 0x4342u);
+        int sumi = 0;
+#pragma unroll
+        for (int t = 0; t < kTritsPerSpan; ++t) {
+            const std::uint32_t w_lo = v_lo * 3u;
+            const std::uint32_t w_hi = v_hi * 3u;
+            v_lo = w_lo & 0x00FF00FFu;
+            v_hi = w_hi & 0x00FF00FFu;
+            const int q = __vsub4(__byte_perm(w_lo, w_hi, 0x7531u), 0x01010101u);
+            const int col = col_base + t * col_step;
+            const int a = *reinterpret_cast<const int*>(xq + group * kGemvGroupK + col);
+            sumi = __dp4a(q, a, sumi);
+        }
+        acc_front = fmaf(gemv_scale(scale_row + group * 2) * xq_scale[group],
+                         static_cast<float>(sumi), acc_front);
+    }
+
+    // qh tail pass 与 dp4a 内核完全相同：lane l 领整组，一次 16 字节装载取回该组 8 个 tail 激活。
+    float acc_tail = 0.0f;
+    for (int group = lane; group < groups_per_row; group += 32) {
+        const uint4 av = *reinterpret_cast<const uint4*>(
+            xq + group * kGemvGroupK + (kGemvGroupK - 16));
+        const std::uint16_t hv =
+            *reinterpret_cast<const std::uint16_t*>(high_row + group * 2);
+        const float scale = gemv_scale(scale_row + group * 2) * xq_scale[group];
+        const std::int8_t* ap = reinterpret_cast<const std::int8_t*>(&av) + 8;
+        float wb[4];
+        float wa[4];
+        tail_trits4(hv & 0xFFu, wb);
+        tail_trits4((hv >> 8) & 0xFFu, wa);
+        const float dot =
+            fmaf(wb[0], static_cast<float>(ap[0]), fmaf(wa[0], static_cast<float>(ap[1]),
+            fmaf(wb[1], static_cast<float>(ap[2]), fmaf(wa[1], static_cast<float>(ap[3]),
+            fmaf(wb[2], static_cast<float>(ap[4]), fmaf(wa[2], static_cast<float>(ap[5]),
+            fmaf(wb[3], static_cast<float>(ap[6]), wa[3] * static_cast<float>(ap[7]))))))));
+        acc_tail = fmaf(scale, dot, acc_tail);
+    }
+
+    float value = acc_front + acc_tail;
+#pragma unroll
+    for (int offset = 16; offset > 0; offset >>= 1) {
+        value += __shfl_down_sync(0xffffffffu, value, offset);
+    }
+    if (lane == 0) { out[warp] = __float2bfloat16_rn(value); }
+}
+
 // Small-token-tile variant, for the speculative VERIFY pass (T = draft + 1, i.e. 2..4).
 //
 // A per-token GEMV would re-read every weight for every token, and weights are exactly what the

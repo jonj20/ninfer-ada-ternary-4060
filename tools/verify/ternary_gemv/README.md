@@ -1,7 +1,8 @@
 # PTQ1_0 解码 GEMV 检查
 
-`ternary_rowsplit_gemv.cuh` 里两个解码内核的**正确性 / 带宽 / 精度**检查，以及解码阶段的
-GPU 时间预算拆解。背景与实测结论见 [docs/4060-开发跟踪.md](../../../docs/4060-开发跟踪.md) §9.1。
+`ternary_rowsplit_gemv.cuh` 里三个解码内核（bf16 / int8+`dp4a` / int8+三进制递推）的
+**正确性 / 带宽 / 精度**检查，以及解码阶段的 GPU 时间预算拆解。背景与实测结论见
+[docs/4060-开发跟踪.md](../../../docs/4060-开发跟踪.md) §9.1。
 
 这些脚本不是一次性的：改解码内核时用它们守住回归。第一项是**改完先跑**的门禁。
 
@@ -28,7 +29,7 @@ tools/verify/ternary_gemv/run_checks.sh accuracy    # int8 激活精度
 | 脚本 | 作用 | 判据 |
 |---|---|---|
 | `gemv_reference_check.cu` | 内核 vs CPU 双精度参考 | 每行相对误差 ≤ 2%（实测 0.0038，bf16 舍入量级）|
-| `gemv_bandwidth.cu` | 两个内核的权重带宽 | 只报数，无判据；与 `tools/hbm_bandwidth_probe.cu` 对照 |
+| `gemv_bandwidth.cu` | 三个内核的权重带宽 | 只报数，无判据；与 `tools/hbm_bandwidth_probe.cu` 对照 |
 | `pattern_attribution.cu` | 逐层加工作，看各自代价 | 只报数；用来判断还值不值得改 |
 | `activation_quant_accuracy.cu` | int8 激活路径 vs bf16 路径 | 只报数；看 RMS 比与每行误差分布 |
 | `nsys_decode_budget.py` | 解码阶段 GPU 时间预算 | 需要先跑 nsys，见下 |
@@ -40,6 +41,16 @@ tools/verify/ternary_gemv/run_checks.sh accuracy    # int8 激活精度
 
 覆盖的形状刻意包含边界：奇数行数（257、777，考验行数 guard）、非本模型宽度
 （K=1280 → 10 组、K=3840 → 30 组）、本模型真实组数（5120→40、6144→48）。
+
+### 三个内核的关系
+
+`bf16` 与 `dp4a` 的差别只在激活精度（int8 量化）；`recurrence` 只改解码方式（lane→列映射换成
+llama.cpp 的三进制原地递推），权重与激活的数学**完全相同**——实测 K=5120 / 1536 / 17408 上与
+`dp4a` 逐位一致。`gemv_bandwidth.cu` 会把三个都跑一遍报数。
+
+判断内核是否正确要用逐位对拍或 `reference`，**不要用端到端 greedy 文本比对**：`dp4a` 与
+`recurrence` 的 lane 归约分组不同，部分和相加顺序就不同，logits 末位会在近似打平处翻转，
+文本出现语义等价的措辞差异。这与 int8 激活是同一类现象。
 
 ### 带宽的两个测量陷阱
 
