@@ -17,6 +17,47 @@
 namespace ninfer::ops::detail {
 namespace {
 
+// Scratch for the int8-activation decode path: K int8 values plus one fp32 scale per 128-group.
+// Sized for the widest K this model decodes (17408) with generous headroom, and held for the
+// process lifetime because the decode stream is sequential: one linear op quantizes, consumes, and
+// is finished before the next one starts.
+constexpr std::int32_t kQ8ScratchMaxK = 65536;
+constexpr std::size_t  kQ8ScratchBytes =
+    static_cast<std::size_t>(kQ8ScratchMaxK) + (kQ8ScratchMaxK / 128) * sizeof(float);
+
+std::int8_t* g_q8_scratch = nullptr;
+
+// Allocates on first use, but never inside a CUDA graph capture (cudaMalloc is illegal there and
+// would invalidate the capture). A capture that arrives before the first eager call simply keeps
+// the bf16 path, so correctness never depends on the allocation having happened.
+bool q8_scratch_claim(std::int32_t k, cudaStream_t stream) {
+    if (k > kQ8ScratchMaxK) { return false; }
+    cudaStreamCaptureStatus status = cudaStreamCaptureStatusNone;
+    if (cudaStreamIsCapturing(stream, &status) != cudaSuccess) { return false; }
+    if (g_q8_scratch == nullptr) {
+        if (status != cudaStreamCaptureStatusNone) { return false; }
+        void* ptr = nullptr;
+        if (cudaMalloc(&ptr, kQ8ScratchBytes) != cudaSuccess) {
+            cudaGetLastError();
+            return false;
+        }
+        g_q8_scratch = static_cast<std::int8_t*>(ptr);
+    }
+    return true;
+}
+
+std::int8_t* q8_scratch() { return g_q8_scratch; }
+
+// NINFER_TERNARY_PTQ1_DP4A=0 falls back to the bf16-activation GEMV; the choice is read once so it
+// stays stable across the CUDA graph capture this op runs in (same rule as the switches below).
+[[nodiscard]] inline bool ternary_ptq1_dp4a_enabled() {
+    static const bool enabled = [] {
+        const char* value = std::getenv("NINFER_TERNARY_PTQ1_DP4A");
+        return value == nullptr || std::string(value) != "0";
+    }();
+    return enabled;
+}
+
 // Decode (T == 1) takes the warp-per-row GEMV for PQ2_0. K is a whole number of 128-groups for
 // every width in this model, so that kernel needs no column guard.
 void launch_pq2_gemv(const Tensor& x, const Weight& w, Tensor& out, cudaStream_t stream) {
@@ -68,6 +109,19 @@ void launch_ptq1_gemv(const Tensor& x, const Weight& w, Tensor& out, cudaStream_
     }
     const std::int32_t groups_per_row = w.k / 128;
     const unsigned grid               = static_cast<unsigned>(div_up(w.n, kGemvWarpsPerBlock));
+    if (ternary_ptq1_dp4a_enabled() && q8_scratch_claim(w.k, stream)) {
+        std::int8_t* xq = q8_scratch();
+        float* xq_scale =
+            reinterpret_cast<float*>(q8_scratch() + kQ8ScratchMaxK);
+        ternary_ptq1_quantize_act_kernel<<<1, 256, 0, stream>>>(
+            static_cast<const __nv_bfloat16*>(x.data), xq, xq_scale, groups_per_row);
+        ternary_ptq1_gemv_dp4a_kernel<<<grid, kGemvWarpsPerBlock * 32, 0, stream>>>(
+            xq, xq_scale, static_cast<const std::uint8_t*>(w.qdata),
+            static_cast<const std::uint8_t*>(w.qhigh), static_cast<const std::uint8_t*>(w.scales),
+            static_cast<__nv_bfloat16*>(out.data), w.n, groups_per_row);
+        CUDA_CHECK(cudaGetLastError());
+        return;
+    }
     ternary_ptq1_gemv_kernel<1><<<grid, kGemvWarpsPerBlock * 32, 0, stream>>>(
         static_cast<const __nv_bfloat16*>(x.data), static_cast<const std::uint8_t*>(w.qdata),
         static_cast<const std::uint8_t*>(w.qhigh), static_cast<const std::uint8_t*>(w.scales),

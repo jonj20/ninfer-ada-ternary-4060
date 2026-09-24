@@ -53,25 +53,30 @@ sm_86 / sm_89（3090 / 4090）为兼容与对照平台。
 建议起跑参数：`--kv-dtype rk4v4-e8 --max-context 3584 --prefill-chunk 1024`。
 MTP 投机本期不支持（8G 卡预留 924 MiB 不足）。
 
-### 性能基线（4060，PTQ1_0，仅记录不调优）
+### 性能基线（4060，PTQ1_0）
 
-> 2026-09-24 起 decode 走 **PTQ1_0 SIMD 4-trit 解码 warp-per-row GEMV 快路径**（`NINFER_TERNARY_PTQ1_GEMV=1`），
-> 对比全程参考解码可回退：`NINFER_TERNARY_PTQ1_GEMV=0`。token 序列与参考逐 token 一致。
+> 2026-09-25 起 decode 走 **int8 激活 + `__dp4a` 整数点积**（默认开）。
+> 两级回退开关：`NINFER_TERNARY_PTQ1_DP4A=0` 退回 bf16 激活点积，`NINFER_TERNARY_PTQ1_GEMV=0` 退回 reference 解码。
 
 | 项 | 实测 |
 |---|---|
-| **decode（新快路径）** | **8.33 tok/s**（greedy / rk4v4-e8 / ctx2048 稳态，192 tok） |
-| decode（参考解码回退） | **3.36 tok/s**（greedy / rk4v4-e8 / ctx2048 稳态） |
-| prefill | **9.09 tok/s**（同上，28 tok prompt） |
+| **decode（当前默认）** | **15.3 tok/s**（15.26 / 15.33 / 15.36 三次；greedy / rk4v4-e8 / ctx2048 / 192 tok） |
+| decode（bf16 激活回退） | **13.2 tok/s** |
+| decode（reference 解码回退） | **3.36 tok/s** |
+| prefill | **11.2 tok/s**（612 tok prompt） |
 | 参照：4090 PTQ1_0 | 15.8 tok/s decode |
-| 参照：llama.cpp 同机同文件 | **25 t/s**，差距 ≈ ×3.0（立案前 ×7.4） |
+| 参照：llama.cpp 同机同文件 | **22–28 t/s**，差距 ≈ **×1.6**（优化前 ×7.4） |
 
-decode 快路径收益 ≈ **×2.48**（3.36 → 8.33），源自 SIMD 4-trit 解码 + warp-per-row 结构改写，
-实现与验证见开发文档 §9.3。剩余 ×3.0 差距（llama.cpp 25 t/s 对照）仍是二期首要优化项，
-跟踪见开发文档 §9.1。
+相对 reference 解码累计 **×4.55**。这一轮把根因定位为**指令发射率**而非访存模式：该卡实测可达
+**203 GB/s**，而原内核只有 47 GB/s——每个权重要付 1×FFMA + 1×int→float，且 128 列里 8 列的
+high 平面解码挤在热循环中（单独占 45%）。据此做了三件事：把 8 列 tail 移出热循环、
+把激活按 128 列组量化后用 `__dp4a` 一条指令算 4 个乘加、以及给 tail pass 加 unroll 隐藏延迟。
 
-差距已立案为二期首要优化项（PTQ1_0 base-3 慢路径、缺 GEMV/MMA 快指令），
-跟踪见开发文档 §9.1。两种格式的对比结论见开发文档 §8。
+精度代价已量化：int8 激活使每行相对误差中位数 1.3%，全局幅度（RMS）保持 0.9%；
+`17 * 23` 正控、300 token 长生成、prefill 均无回归。实现、数值对拍与剩余空间见开发文档 §9.1。
+
+两条已证伪的路线（避免重复投入）：cp.async / shared-memory staging（实测 67–70 GB/s，
+因为瓶颈不是延迟隐藏），以及 kernel 内重复量化激活（量化本身约 25 指令/组，吃掉全部收益）。
 
 ---
 

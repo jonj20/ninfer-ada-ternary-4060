@@ -144,6 +144,91 @@ void ternary_ptq1_gemv_kernel(const __nv_bfloat16* __restrict__ x,
                                       : trit <= 0 ? 1u : trit == 1 ? 3u : trit == 2 ? 9u : trit == 3 ? 27u : 81u;
     std::uint32_t v_lo = 0u, v_hi = 0u;
 
+    if constexpr (kT == 1) {
+        // Single-token decode path. Fully branch-free on purpose: an in-loop `if (!is_tail)`
+        // forces BSSY/BSYNC reconvergence barriers around every unrolled group, which stops the
+        // compiler hoisting the weight/activation loads across iterations (measured 47 GB/s
+        // branchy vs 110 GB/s branch-free on sm_89).
+        float acc_front = 0.0f;
+        // Lane mask is a loop invariant: hoisting the select out of the group loop keeps the body
+        // free of branches (an in-loop select re-materialises as BSSY/BSYNC and costs ~2x).
+        const float weight_mask = is_tail ? 0.0f : 1.0f;
+#pragma unroll 8
+        for (int group = 0; group < groups_per_row; ++group) {
+            const std::int32_t base = group * kGemvGroupK + lane * 4;
+            const float scale = gemv_scale(scale_row + group * kGemvScaleBytesPerGroup);
+
+            // One 4-byte load per group per lane: bytes 4*(lane&3)..+3 (front) or 16+.. (mid).
+            // Lanes 30/31 re-read the mid-quad bytes here; their weights are masked out below.
+            v_lo = __byte_perm(*reinterpret_cast<const std::uint32_t*>(code_row + group * 24 + quad_off), 0u, 0x4140u);
+            v_hi = __byte_perm(*reinterpret_cast<const std::uint32_t*>(code_row + group * 24 + quad_off), 0u, 0x4342u);
+            v_lo = (v_lo * pow3) & 0x00FF00FFu;
+            v_hi = (v_hi * pow3) & 0x00FF00FFu;
+            v_lo *= 3u;
+            v_hi *= 3u;
+
+            // Four bf16 activations (columns 4l..4l+3) are 8-byte aligned: one 64-bit load,
+            // de-pack the two float2 pairs in registers.
+            const std::uint64_t ract =
+                *reinterpret_cast<const std::uint64_t*>(x + base);
+            const __nv_bfloat162* racq = reinterpret_cast<const __nv_bfloat162*>(&ract);
+            const float2 lo = __bfloat1622float2(racq[0]);
+            const float2 hi = __bfloat1622float2(racq[1]);
+
+            // Four signed bytes of the SIMD step: each is one weight in {-1, 0, 1}.
+            const std::uint32_t q =
+                __vsub4(__byte_perm(v_lo, v_hi, 0x7531u), 0x01010101u);
+            const float w0 = static_cast<float>(static_cast<std::int8_t>(q & 0xFFu));
+            const float w1 = static_cast<float>(static_cast<std::int8_t>((q >> 8) & 0xFFu));
+            const float w2 = static_cast<float>(static_cast<std::int8_t>((q >> 16) & 0xFFu));
+            const float w3 = static_cast<float>(static_cast<std::int8_t>((q >> 24) & 0xFFu));
+
+            // Lanes 30/31 own no front/mid columns, so weight_mask zeroes the bytes they re-read.
+            const float dot = fmaf(w0, lo.x, fmaf(w1, lo.y, fmaf(w2, hi.x, w3 * hi.y))) *
+                              weight_mask;
+            acc_front = fmaf(scale, dot, acc_front);
+        }
+
+        // The 8 qh tail columns (120..127) live in the 2-byte high plane, not the code plane, so
+        // they need a different decode. Folding that into the group loop costs ~45% of throughput
+        // (measured 110 -> 57 GB/s on the gate_up shape: the kernel is instruction-issue bound, so
+        // every extra instruction in that loop costs directly). Instead each lane owns one tail
+        // column for a strided subset of groups: lane l handles column 120 + (l & 7) across groups
+        // (l >> 3), stride 4. The eight lanes sharing a group base cover that group's 8 columns, so
+        // every (group, tail column) pair is still visited exactly once, and the warp reduction
+        // sums both passes. Cost: ~5 instructions per 4 groups instead of ~15 per group.
+        float acc_tail = 0.0f;
+        {
+            const int      tail_col  = lane & 7;
+            const int      tail_byte = tail_col & 1;
+            const unsigned tail_pow3 = ternary_pow3(tail_col >> 1);
+            const int      tail_act  = kGemvGroupK - 8 + tail_col;  // 120 + (l & 7)
+            // Unrolled on purpose: this loop is short and runs after the main loop, so without
+            // lookahead its three loads per iteration are fully exposed (measured 159 -> 87 GB/s on
+            // a 312 MB payload, i.e. the tail pass cost as much as 45% of the whole kernel).
+#pragma unroll 8
+            for (int group = lane >> 3; group < groups_per_row; group += 4) {
+                const std::uint8_t qb = static_cast<std::uint8_t>(
+                    high_row[group * 2 + tail_byte] * tail_pow3);
+                const float w = static_cast<float>(
+                    static_cast<int>((static_cast<std::uint16_t>(qb) * 3u) >> 8) - 1);
+                acc_tail = fmaf(gemv_scale(scale_row + group * kGemvScaleBytesPerGroup),
+                                w * static_cast<float>(__bfloat162float(x[group * kGemvGroupK + tail_act])),
+                                acc_tail);
+            }
+        }
+
+        float value = acc_front + acc_tail;
+#pragma unroll
+        for (int offset = 16; offset > 0; offset >>= 1) {
+            value += __shfl_down_sync(0xffffffffu, value, offset);
+        }
+        if (lane == 0) {
+            out[warp] = __float2bfloat16_rn(value);
+        }
+        return;
+    }
+
     float accumulator[kT];
 #pragma unroll
     for (int t = 0; t < kT; ++t) { accumulator[t] = 0.0f; }
@@ -215,6 +300,128 @@ void ternary_ptq1_gemv_kernel(const __nv_bfloat16* __restrict__ x,
                 __float2bfloat16_rn(value);
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// int8-activation decode GEMV (T == 1): the same PTQ1_0 math with an integer dot product.
+//
+// Why: the bf16 path above spends one FFMA plus one int-to-float conversion per weight, ~30
+// instructions per 128-group, and on sm_89 that instruction pressure -- not DRAM -- is what caps
+// decode (measured 2.2 of 4 IPC at 98 GB/s on the 39 MB gate_up tensor). Quantizing the activation
+// vector to int8 once per linear op lets one dp4a carry four weight-activation products, which
+// takes the inner loop to ~15 instructions per group (measured 151.7 GB/s, i.e. DRAM-bound).
+// This mirrors what llama.cpp's mmvq does with q8_1 activations.
+//
+// Quantization is per 128-column group, matching the weight group so one scale multiply covers both
+// sides. Warp w owns groups w, w+8, ... and lane holds four of the 128 values, so the activation is
+// read once and the reduction stays inside the warp (no block barrier).
+__global__ __launch_bounds__(256)
+void ternary_ptq1_quantize_act_kernel(const __nv_bfloat16* __restrict__ x,
+                                       std::int8_t* __restrict__ xq, float* __restrict__ xq_scale,
+                                       std::int32_t groups) {
+    const int lane = static_cast<int>(threadIdx.x) & 31;
+    const int warp = static_cast<int>(threadIdx.x) >> 5;
+    for (int g = warp; g < groups; g += 8) {
+        const std::int32_t base = g * kGemvGroupK + lane * 4;
+        const float2 lo = __bfloat1622float2(
+            *reinterpret_cast<const __nv_bfloat162*>(x + base));
+        const float2 hi = __bfloat1622float2(
+            *reinterpret_cast<const __nv_bfloat162*>(x + base + 2));
+        float m = fmaxf(fmaxf(fabsf(lo.x), fabsf(lo.y)), fmaxf(fabsf(hi.x), fabsf(hi.y)));
+#pragma unroll
+        for (int offset = 16; offset > 0; offset >>= 1) {
+            m = fmaxf(m, __shfl_xor_sync(0xffffffffu, m, offset));
+        }
+        const float inv = (m > 0.0f) ? (127.0f / m) : 0.0f;
+        xq_scale[g] = m * (1.0f / 127.0f);
+        const int q0 = static_cast<int>(fmaxf(-127.0f, fminf(127.0f, lo.x * inv)));
+        const int q1 = static_cast<int>(fmaxf(-127.0f, fminf(127.0f, lo.y * inv)));
+        const int q2 = static_cast<int>(fmaxf(-127.0f, fminf(127.0f, hi.x * inv)));
+        const int q3 = static_cast<int>(fmaxf(-127.0f, fminf(127.0f, hi.y * inv)));
+        *reinterpret_cast<int*>(xq + base) = (q0 & 0xFF) | ((q1 & 0xFF) << 8) |
+                                            ((q2 & 0xFF) << 16) | ((q3 & 0xFF) << 24);
+    }
+}
+
+// Integer dot-product decode GEMV. Same row/lane mapping and same tail pass as the bf16 kernel
+// above, so the two produce the same result up to activation quantization.
+__global__ __launch_bounds__(kGemvWarpsPerBlock * 32)
+void ternary_ptq1_gemv_dp4a_kernel(const std::int8_t* __restrict__ xq,
+                                   const float* __restrict__ xq_scale,
+                                   const std::uint8_t* __restrict__ codes,
+                                   const std::uint8_t* __restrict__ high,
+                                   const std::uint8_t* __restrict__ scales,
+                                   __nv_bfloat16* __restrict__ out, std::int32_t rows,
+                                   std::int32_t groups_per_row) {
+    const int lane = static_cast<int>(threadIdx.x) & 31;
+    const int warp =
+        static_cast<int>(blockIdx.x) * kGemvWarpsPerBlock + (static_cast<int>(threadIdx.x) >> 5);
+    if (warp >= rows) { return; }
+
+    const std::uint8_t* code_row =
+        codes + static_cast<std::int64_t>(warp) * groups_per_row * 24;
+    const std::uint8_t* high_row =
+        high + static_cast<std::int64_t>(warp) * groups_per_row * 2;
+    const std::uint8_t* scale_row =
+        scales + static_cast<std::int64_t>(warp) * groups_per_row * 2;
+
+    const int  quad_off = lane < 20 ? 4 * (lane & 3) : 16 + 4 * ((lane - 20) & 1);
+    const int  trit     = lane < 20 ? lane >> 2 : (lane - 20) >> 1;
+    const unsigned pow3 = trit <= 0 ? 1u : trit == 1 ? 3u : trit == 2 ? 9u : trit == 3 ? 27u : 81u;
+    // Lanes 30/31 own no front/mid column; zeroing their quad keeps the mask out of the loop.
+    const std::uint32_t quad_mask = (lane >= 30) ? 0u : 0xFFFFFFFFu;
+
+    float acc_front = 0.0f;
+#pragma unroll 8
+    for (int group = 0; group < groups_per_row; ++group) {
+        const int a_packed =
+            *reinterpret_cast<const int*>(xq + group * kGemvGroupK + lane * 4);
+        const float a_scale = xq_scale[group];
+
+        std::uint32_t v_lo =
+            __byte_perm(*reinterpret_cast<const std::uint32_t*>(code_row + group * 24 + quad_off),
+                        0u, 0x4140u);
+        std::uint32_t v_hi =
+            __byte_perm(*reinterpret_cast<const std::uint32_t*>(code_row + group * 24 + quad_off),
+                        0u, 0x4342u);
+        v_lo = (v_lo * pow3) & 0x00FF00FFu;
+        v_hi = (v_hi * pow3) & 0x00FF00FFu;
+        v_lo *= 3u;
+        v_hi *= 3u;
+        // Four signed bytes: four weights in {-1, 0, 1}, ready for one dp4a.
+        const std::uint32_t q =
+            (__vsub4(__byte_perm(v_lo, v_hi, 0x7531u), 0x01010101u)) & quad_mask;
+
+        const int dot = __dp4a(static_cast<int>(q), a_packed, 0);
+        acc_front = fmaf(gemv_scale(scale_row + group * kGemvScaleBytesPerGroup) * a_scale,
+                         static_cast<float>(dot), acc_front);
+    }
+
+    // qh tail pass, unchanged from the bf16 kernel: lane l owns tail column (l & 7) for groups
+    // (l >> 3) with stride 4, so the 8 columns leave the hot loop entirely.
+    float acc_tail = 0.0f;
+    {
+        const int      tail_col  = lane & 7;
+        const int      tail_byte = tail_col & 1;
+        const unsigned tail_pow3 = ternary_pow3(tail_col >> 1);
+        for (int group = lane >> 3; group < groups_per_row; group += 4) {
+            const std::uint8_t qb = static_cast<std::uint8_t>(
+                high_row[group * 2 + tail_byte] * tail_pow3);
+            const float w = static_cast<float>(
+                static_cast<int>((static_cast<std::uint16_t>(qb) * 3u) >> 8) - 1);
+            const int a = static_cast<int>(
+                xq[group * kGemvGroupK + kGemvGroupK - 8 + tail_col]);
+            acc_tail = fmaf(gemv_scale(scale_row + group * kGemvScaleBytesPerGroup) * xq_scale[group],
+                            w * static_cast<float>(a), acc_tail);
+        }
+    }
+
+    float value = acc_front + acc_tail;
+#pragma unroll
+    for (int offset = 16; offset > 0; offset >>= 1) {
+        value += __shfl_down_sync(0xffffffffu, value, offset);
+    }
+    if (lane == 0) { out[warp] = __float2bfloat16_rn(value); }
 }
 
 // Small-token-tile variant, for the speculative VERIFY pass (T = draft + 1, i.e. 2..4).
