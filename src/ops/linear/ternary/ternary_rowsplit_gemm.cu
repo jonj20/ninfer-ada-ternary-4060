@@ -8,8 +8,10 @@
 #include "ops/linear/ternary/ternary_launch.h"
 #include "ops/linear/ternary/ternary_rowsplit_gemv.cuh"
 #include "ops/linear/ternary/ternary_rowsplit_mma_small_t.cuh"
+#include "ops/linear/ternary/ternary_rowsplit_prefill.cuh"
 
 #include <cstdint>
+#include <cstdio>
 #include <cstdlib>
 #include <stdexcept>
 #include <string>
@@ -47,6 +49,58 @@ bool q8_scratch_claim(std::int32_t k, cudaStream_t stream) {
 }
 
 std::int8_t* q8_scratch() { return g_q8_scratch; }
+
+// ---------------------------------------------------------------------------
+// PTQ1_0 批量 prefill 的 int8 激活 scratch。
+//
+// 与解码那套不同，prefill 的 x 是 [K, T]，所以要量化激活加每 (token, group) 一个 fp32 scale。
+// 布局按「最坏 K × 最坏 T」固定：xq 占 k*kPrefillQ8MaxTokens 字节，scale 紧跟其后，同样按
+// kPrefillQ8MaxTokens 步进。scale 的偏移必须用同一个固定步进，分配大小也必须按这个布局算——
+// 早先一个版本按实际 T 算分配、用固定步进取 scale，于是 T>1024 时 scale 落进 xq 里（读到 int8
+// 数据当 float），T 很小时又越界踩内存。固定布局把这两个数绑在一起，那种错配就不可能发生。
+constexpr std::int32_t kPrefillQ8MaxK      = 17408;
+constexpr std::int32_t kPrefillQ8MaxTokens = 1024;
+constexpr std::int32_t kPrefillQ8MaxGroups = kPrefillQ8MaxK / 128;
+constexpr std::size_t  kPrefillQ8Bytes =
+    static_cast<std::size_t>(kPrefillQ8MaxK) * kPrefillQ8MaxTokens +
+    static_cast<std::size_t>(kPrefillQ8MaxTokens) * kPrefillQ8MaxGroups * sizeof(float);
+
+std::int8_t* g_prefill_q8      = nullptr;
+std::size_t  g_prefill_q8_size = 0;
+
+float* prefill_q8_scale(std::int8_t* base, std::int32_t k) {
+    return reinterpret_cast<float*>(base + static_cast<std::size_t>(k) * kPrefillQ8MaxTokens);
+}
+
+cudaStreamCaptureStatus prefill_q8_capture_status(cudaStream_t stream) {
+    cudaStreamCaptureStatus status = cudaStreamCaptureStatusNone;
+    if (cudaStreamIsCapturing(stream, &status) != cudaSuccess) {
+        cudaGetLastError();
+        return static_cast<cudaStreamCaptureStatus>(-1);
+    }
+    return status;
+}
+
+bool prefill_q8_claim(std::int32_t k, std::int32_t tokens, cudaStream_t stream) {
+    if (k > kPrefillQ8MaxK || tokens > kPrefillQ8MaxTokens) { return false; }
+    const std::size_t need = static_cast<std::size_t>(k) * kPrefillQ8MaxTokens +
+                             static_cast<std::size_t>(kPrefillQ8MaxTokens) * kPrefillQ8MaxGroups *
+                                 sizeof(float);
+    const cudaStreamCaptureStatus status = prefill_q8_capture_status(stream);
+    const bool capturing = (status != cudaStreamCaptureStatusNone &&
+                            status != static_cast<cudaStreamCaptureStatus>(-1));
+    if (g_prefill_q8 == nullptr) {
+        if (capturing) { return false; }
+        void* ptr = nullptr;
+        if (cudaMalloc(&ptr, kPrefillQ8Bytes) != cudaSuccess) {
+            cudaGetLastError();
+            return false;
+        }
+        g_prefill_q8      = static_cast<std::int8_t*>(ptr);
+        g_prefill_q8_size = kPrefillQ8Bytes;
+    }
+    return need <= g_prefill_q8_size;
+}
 
 // NINFER_TERNARY_PTQ1_DP4A=0 falls back to the bf16-activation GEMV; the choice is read once so it
 // stays stable across the CUDA graph capture this op runs in (same rule as the switches below).
@@ -290,6 +344,51 @@ void launch_pq2_mma_small_t(const Tensor& x, const Weight& w, Tensor& out,
     CUDA_CHECK(cudaGetLastError());
 }
 
+// NINFER_TERNARY_PTQ1_PREFILL=0 退回参考 t8 内核，是这条路径的端到端 A/B 开关。
+[[nodiscard]] inline bool ternary_ptq1_prefill_enabled() {
+    static const bool enabled = [] {
+        const char* value = std::getenv("NINFER_TERNARY_PTQ1_PREFILL");
+        return value == nullptr || std::string(value) != "0";
+    }();
+    return enabled;
+}
+
+// 每 CTA 的形状按 token 数分档：token 少时用小 tile，避免为无效 token 白算。
+// 实测最优是 64 行 × 64 token × 128 线程（R8/TT4/RG8/TG16），四个真实形状上都是 3.1–3.4 TMAC/s。
+template <int R, int TT, int ROW_GROUPS, int TOK_GROUPS>
+void launch_ptq1_prefill_tile(const Tensor& x, const Weight& w, Tensor& out,
+                              std::int32_t out_row_stride, cudaStream_t stream) {
+    using Tile = Ptq1PrefillTile<R, TT, ROW_GROUPS, TOK_GROUPS>;
+    const std::int32_t tokens = x.ne[1];
+    const std::int32_t groups = w.k / 128;
+    std::int8_t* xq       = g_prefill_q8;
+    float*       xq_scale = prefill_q8_scale(g_prefill_q8, w.k);
+
+    const unsigned qgrid =
+        static_cast<unsigned>(div_up(tokens * groups, Ptq1QuantThreads / 32));
+    ternary_ptq1_quantize_act_batch_kernel<<<qgrid, Ptq1QuantThreads, 0, stream>>>(
+        static_cast<const __nv_bfloat16*>(x.data), xq, xq_scale, w.k, tokens, groups);
+
+    const dim3 grid(static_cast<unsigned>(div_up(w.n, Tile::kRowsPerCta)),
+                    static_cast<unsigned>(div_up(tokens, Tile::kTokensPerCta)), 1u);
+    ternary_ptq1_prefill_dp4a_kernel<R, TT, ROW_GROUPS, TOK_GROUPS>
+        <<<grid, Tile::kThreads, 0, stream>>>(xq, xq_scale,
+                                              static_cast<const std::uint8_t*>(w.qdata),
+                                              static_cast<const std::uint8_t*>(w.qhigh),
+                                              static_cast<const std::uint8_t*>(w.scales),
+                                              static_cast<__nv_bfloat16*>(out.data), w.n, w.k,
+                                              tokens, groups, out_row_stride);
+    CUDA_CHECK(cudaGetLastError());
+}
+
+// PTQ1_0 批量 prefill 的准入条件与解码 GEMV 相同，外加 T 落在批量区间内。
+// T >= 4 而不是更高：serve 的 staged prefill 是按 9 个 token 一批调用线性层的（实测 T=9），
+// 阈值更高就会整条预填充都留在参考 t8 内核上。
+bool ptq1_prefill_admits(const Tensor& x, const Weight& w) {
+    return w.qtype == QType::PTQ1_0_G128 && w.qhigh != nullptr && w.padded_shape[1] == w.k &&
+           (w.k % 128) == 0 && x.ne[1] >= 4;
+}
+
 void launch_ternary_gemm_t8(const Tensor& x, const Weight& w, Tensor& out,
                             std::int32_t out_row_stride, cudaStream_t stream) {
     // The speculative verify pass runs T = draft + 1 (2..4 here). Prefill arrives with T >= 128
@@ -300,9 +399,48 @@ void launch_ternary_gemm_t8(const Tensor& x, const Weight& w, Tensor& out,
         launch_pq2_mma_small_t(x, w, out, out_row_stride, x.ne[1], stream);
         return;
     }
+    if (ternary_ptq1_prefill_enabled() && ptq1_prefill_admits(x, w)) {
+        if (prefill_q8_claim(w.k, x.ne[1], stream)) {
+            if (x.ne[1] >= 64) {
+                launch_ptq1_prefill_tile<8, 4, 8, 16>(x, w, out, out_row_stride, stream);
+            } else if (x.ne[1] >= 16) {
+                launch_ptq1_prefill_tile<8, 2, 8, 16>(x, w, out, out_row_stride, stream);
+            } else {
+                launch_ptq1_prefill_tile<8, 4, 8, 4>(x, w, out, out_row_stride, stream);
+            }
+            return;
+        }
+        // 诊断：scratch 拿不到会永久回退参考内核，这里报一次原因（默认静默）
+        static const bool verbose = [] {
+            const char* v = std::getenv("NINFER_TERNARY_PTQ1_PREFILL_VERBOSE");
+            return v != nullptr && std::string(v) != "0";
+        }();
+        static bool reported = false;
+        if (verbose && !reported) {
+            reported = true;
+            std::fprintf(stderr,
+                         "[ninfer] ptq1 prefill scratch unavailable: k=%d tokens=%d max_k=%d "
+                         "max_tokens=%d held=%zu capture=%d\n",
+                         w.k, x.ne[1], kPrefillQ8MaxK, kPrefillQ8MaxTokens, g_prefill_q8_size,
+                         static_cast<int>(prefill_q8_capture_status(stream)));
+        }
+    }
     if (gemv_admits(x, w, 4)) {
         launch_pq2_gemv_tile(x, w, out, out_row_stride, x.ne[1], stream);
         return;
+    }
+    {
+        static const bool verbose = [] {
+            const char* v = std::getenv("NINFER_TERNARY_PTQ1_PREFILL_VERBOSE");
+            return v != nullptr && std::string(v) != "0";
+        }();
+        static int printed = 0;
+        if (verbose && printed < 12) {
+            ++printed;
+            std::fprintf(stderr, "[ninfer] ptq1 t8 fallback: T=%d k=%d n=%d qtype=%d qhigh=%d\n",
+                         x.ne[1], w.k, w.n, static_cast<int>(w.qtype),
+                         w.qhigh != nullptr ? 1 : 0);
+        }
     }
     launch_by_qtype<8>(x, w, out, out_row_stride, stream);
 }

@@ -50,12 +50,13 @@ build_standalone() {
 }
 
 case "${which}" in
-  reference) build_with_engine gemv_reference_check ;;
+  reference) build_with_engine gemv_reference_check; build_with_engine prefill_reference_check ;;
   bandwidth) build_with_engine gemv_bandwidth ;;
   accuracy)  build_with_engine activation_quant_accuracy ;;
   pattern)   build_standalone pattern_attribution ;;
   all)
     build_with_engine gemv_reference_check
+    build_with_engine prefill_reference_check
     build_with_engine gemv_bandwidth
     build_with_engine activation_quant_accuracy
     build_standalone pattern_attribution
@@ -65,11 +66,19 @@ esac
 
 if [[ "${which}" == "reference" || "${which}" == "all" ]]; then
   echo
-  echo "=== 数值对拍：内核 vs CPU 参考（容差 = bf16 舍入）==="
+  echo "=== 数值对拍：解码内核 vs CPU 参考（容差 = bf16 舍入）==="
   if "${WORK_DIR}/gemv_reference_check"; then
     echo "reference: PASS"
   else
     echo "reference: FAIL" >&2
+    rc=1
+  fi
+  echo
+  echo "=== 数值对拍：批量 prefill 内核 vs CPU 参考 ==="
+  if "${WORK_DIR}/prefill_reference_check"; then
+    echo "prefill_reference: PASS"
+  else
+    echo "prefill_reference: FAIL" >&2
     rc=1
   fi
 fi
