@@ -1,6 +1,6 @@
 # PTQ1_0 解码 GEMV 检查
 
-`ternary_rowsplit_gemv.cuh` 里三个解码内核（bf16 / int8+`dp4a` / int8+三进制递推）的
+`ternary_rowsplit_gemv.cuh` / `ternary_rowsplit_prefill.cuh` 里几个解码与 prefill 内核的
 **正确性 / 带宽 / 精度**检查，以及解码阶段的 GPU 时间预算拆解。背景与实测结论见
 [docs/4060-开发跟踪.md](../../../docs/4060-开发跟踪.md) §9.1。
 
@@ -28,11 +28,25 @@ tools/verify/ternary_gemv/run_checks.sh accuracy    # int8 激活精度
 
 | 脚本 | 作用 | 判据 |
 |---|---|---|
-| `gemv_reference_check.cu` | 内核 vs CPU 双精度参考 | 每行相对误差 ≤ 2%（实测 0.0038，bf16 舍入量级）|
-| `gemv_bandwidth.cu` | 三个内核的权重带宽 | 只报数，无判据；与 `tools/hbm_bandwidth_probe.cu` 对照 |
+| `gemv_reference_check.cu` | 解码内核 vs CPU 双精度参考 | 每行相对误差 ≤ 2%（实测 0.0038，bf16 舍入量级）|
+| `prefill_reference_check.cu` | 批量 prefill 内核 vs CPU 双精度参考 | 整表最大幅度归一 ≤ 2%；12 组形状含 token 装不满 tile、行数非 CTA 行块倍数、qh tail 生效/清零 |
+| `gemv_bandwidth.cu` | 三个解码内核的权重带宽 | 只报数，无判据；与 `tools/hbm_bandwidth_probe.cu` 对照 |
 | `pattern_attribution.cu` | 逐层加工作，看各自代价 | 只报数；用来判断还值不值得改 |
 | `activation_quant_accuracy.cu` | int8 激活路径 vs bf16 路径 | 只报数；看 RMS 比与每行误差分布 |
 | `nsys_decode_budget.py` | 解码阶段 GPU 时间预算 | 需要先跑 nsys，见下 |
+
+### 批量 prefill 内核的开发中真 bug
+
+qh 的 8 列（列 120..127）解码形状与四列 quad 不同，用 FFMA 逐 token 累加。第一版写成了
+
+```cpp
+float tail = 0.0f;
+for (int t = 0; t < TT; ++t) { tail = fmaf(...); }   // 赋值，不是累加
+```
+
+循环结束后 `tail` 只剩**最后一个 token** 的值，还被加到所有 token 上；token 数装不满 tile 时
+最后那个 token 越界，读到的是 OOB 垃圾。端到端冒烟与 391 正控都看不出来（生成文本仍然连贯），
+只有 `prefill_reference_check` 抓到——所以它和 `gemv_reference_check` 一样是门禁，不是可选项。
 
 ### 为什么 `gemv_reference_check` 是门禁而不是可选
 

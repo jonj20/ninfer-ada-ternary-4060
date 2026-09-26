@@ -55,25 +55,35 @@ MTP 投机本期不支持（8G 卡预留 924 MiB 不足）。
 
 ### 性能基线（4060，PTQ1_0）
 
-> 2026-09-25 起 decode 走 **int8 激活 + `__dp4a` 整数点积 + 三进制递推解码**（默认开）。
-> 三级回退开关：`NINFER_TERNARY_PTQ1_RECURRENCE=0` 退回每 lane 一个 trit 的 dp4a 内核，
+> **当前状态的完整快照**（指标、剩余空间、已证伪方向、已知问题、复现命令）见
+> [docs/4060-优化状态.md](docs/4060-优化状态.md)；实验过程见 [docs/4060-开发跟踪.md](docs/4060-开发跟踪.md) §9.1。
+
+> 2026-09-25 起 decode 走 **int8 激活 + `__dp4a` 整数点积 + 三进制递推解码**，prefill 走
+> **批量 int8 `dp4a` GEMM**（默认都开）。
+> 三级回退开关：`NINFER_TERNARY_PTQ1_RECURRENCE=0` 退回每 lane 一个 trit 的解码内核，
+> `NINFER_TERNARY_PTQ1_PREFILL=0` 退回参考分块 GEMM，
 > `NINFER_TERNARY_PTQ1_DP4A=0` 退回 bf16 激活点积，`NINFER_TERNARY_PTQ1_GEMV=0` 退回 reference 解码。
 
 | 项 | 实测 |
 |---|---|
 | **decode（当前默认）** | **22.6 tok/s**（22.60 / 22.63；greedy / rk4v4-e8 / ctx2048 / 192 tok） |
+| **prefill（当前默认）** | **125 tok/s**（401 / 781 / 1541 token prompt 分别 111 / 122 / 125） |
 | decode（递推解码回退） | **17.0 tok/s** |
 | decode（bf16 激活回退） | **13.2 tok/s** |
 | decode（reference 解码回退） | **3.36 tok/s** |
-| prefill | **11.2 tok/s**（612 tok prompt） |
+| prefill（reference 分块 GEMM 回退） | **10.9 tok/s** |
 | 参照：4090 PTQ1_0 | 15.8 tok/s decode |
-| 参照：llama.cpp 同机同文件 | **22–28 t/s**，已收平到其下沿（优化前 ×7.4） |
+| 参照：llama.cpp 同机同文件 | **22–28 t/s** decode，已收平到其下沿（优化前 ×7.4） |
 
-相对 reference 解码累计 **×6.7**。根因是**每权重的指令数**，不是访存模式也不是权重布局：权重流单独
-能跑 223–230 GB/s（该卡可达上限 **249.6 GB/s**），而原内核只有 47 GB/s。为此做了四件事：把 8 列
+相对 reference 解码累计 **×6.7**，相对 reference 预填充累计 **×11.5**。根因是**每权重的指令数**，不是访存模式也不是权重布局：权重流单独
+能跑 223–230 GB/s（该卡可达上限 **249.6 GB/s**），而原内核只有 47 GB/s。为此做了五件事：把 8 列
 high 平面 tail 移出热循环并向量化、把激活按 128 列组量化后用 `__dp4a` 一条指令算 4 个乘加、
-按 llama.cpp 的三进制递推重排 lane→列映射（每 lane 一次吃掉一个 4 字节 span 的全部 5 个 trit，
+按 llama.cpp 的三进制递推重排解码的 lane→列映射（每 lane 一次吃掉一个 4 字节 span 的全部 5 个 trit，
 一次拓宽摊薄 5 倍）、以及 tail 装载与累加器拆分等微调。
+
+预填充原先完全没吃到这些优化：参考分块 GEMM 每个 CTA 只做一个输出行，激活向量被重复读 rows 次
+（gate_up 每层约 108 GB 的 L2 流量），实测 0.27 TMAC/s、只有 FFMA 峰值的 0.4%。批量内核让每 CTA 覆盖
+64 行 × 64 token，实测 3.1–3.4 TMAC/s（gate_up ×11.7、MLP down ×12.1、attn/GDN ×11.0、LM head ×11.4）。
 
 访存归因（`tools/verify/ternary_gemv/pattern_attribution.cu`）显示激活读取**免费**，剩余代价平摊在
 侧流 load、base-3 解码与累加上；**重打包权重布局已否证**（改成单平面交错后与三平面持平或更慢）。
@@ -125,6 +135,19 @@ Rocky Linux 10 上可以用仓内脚本一次装齐（见 [依赖安装](docs/�
     ninfer-convert             # 打印转换器用法
 
 细节、环境变量、离线安装与排错见 [把本仓当工具用](docs/uv-工具安装.md)。
+
+### 直接起服务聊天
+
+仓内脚本会自己挑最新的 `ninfer-serve` 构建（这台机器上仓内 `build_4060` 与 `/home/jon/build_4060b`
+并存，旧的会被跳过），并按 8G 卡实测参数启动：
+
+    scripts/run-ternary-4060.sh                      # 默认 8192 上下文、rk4v4-e8、并发 1
+    scripts/run-ternary-4060.sh /path/to/model.ninfer  # 换模型
+    NINFER_CTX=4096 NINFER_PORT=9000 scripts/run-ternary-4060.sh
+
+起来后打开 **http://localhost:8080/** 就是内置的 llama.cpp WebUI；接口是 OpenAI 兼容的
+（`/v1/chat/completions`、`/v1/responses`、Anthropic `/v1/messages`）。装载权重约 60–70 秒。
+全部可调项见脚本头部注释。
 
 ---
 
