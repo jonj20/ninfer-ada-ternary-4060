@@ -29,11 +29,39 @@ tools/verify/ternary_gemv/run_checks.sh accuracy    # int8 激活精度
 | 脚本 | 作用 | 判据 |
 |---|---|---|
 | `gemv_reference_check.cu` | 解码内核 vs CPU 双精度参考 | 每行相对误差 ≤ 2%（实测 0.0038，bf16 舍入量级）|
-| `prefill_reference_check.cu` | 批量 prefill 内核 vs CPU 双精度参考 | 整表最大幅度归一 ≤ 2%；12 组形状含 token 装不满 tile、行数非 CTA 行块倍数、qh tail 生效/清零 |
+| `prefill_reference_check.cu` | 批量 prefill 内核 vs CPU 双精度参考 | 整表最大幅度归一 ≤ 2%；四档 tile × 16 组形状，含 token 装不满 tile、行数非 CTA 行块倍数、qh tail 生效/清零，以及投机验证的 T=2/3/4 |
 | `gemv_bandwidth.cu` | 三个解码内核的权重带宽 | 只报数，无判据；与 `tools/hbm_bandwidth_probe.cu` 对照 |
+| `prefill_tile_sweep.cu` | 批量内核各档 tile 的耗时 / 等效带宽 / CTA 数 | 只报数；某候选比当前分派快 15% 以上会显式标出 |
 | `pattern_attribution.cu` | 逐层加工作，看各自代价 | 只报数；用来判断还值不值得改 |
 | `activation_quant_accuracy.cu` | int8 激活路径 vs bf16 路径 | 只报数；看 RMS 比与每行误差分布 |
 | `nsys_decode_budget.py` | 解码阶段 GPU 时间预算 | 需要先跑 nsys，见下 |
+
+### 批量 tile 的两条硬约束（`prefill_tile_sweep` 的存在理由）
+
+`Ptq1PrefillTile<R, TT, ROW_GROUPS, TOK_GROUPS>` 的三个量是绑在一起的：
+
+```
+kRowsPerCta  = R * ROW_GROUPS
+kTokensPerCta = TT * TOK_GROUPS
+kThreads     = ROW_GROUPS * TOK_GROUPS
+grid = (div_up(rows, kRowsPerCta), div_up(tokens, kTokensPerCta))
+```
+
+1. **`kTokensPerCta` 必须 ≥ T**，否则 `grid.y > 1`，而同一 `grid.x` 的各个 y 会重读同一批权重行，
+   权重流量按 `grid.y` 翻倍。T=9 用 `kTokensPerCta=4` 会把权重读三遍。
+2. 在 `kTokensPerCta` 刚好覆盖 T 的前提下，**`kRowsPerCta` 越小 CTA 数越多**。CTA 太少会退化成
+   延迟受限：旧的 T<16 配置 `kRowsPerCta=64`，n=17408 时只有 80 个 CTA，MLP down 整层只有
+   42.7 GB/s，而解码的 GEMV 是 142 GB/s。
+
+开发中 MTP 的目标验证（`T = draft + 1`，只有 2..4）就是卡在第 2 条上：换到
+`kRowsPerCta=16` 之后，`T=2` 的 MLP down 从 750 ms 降到 229 ms、LM head 到 2.23 ms
+（124 GB/s），端到端每轮 192 → 71 ms。当前分派见 `ternary_rowsplit_gemm.cu` 的
+`launch_ternary_gemm_t8`。
+
+`tile` 档位对 T=3/T=4 仍会标出 20~40% 的候选空间，但**各形状的最优配置不一致**（down 偏好
+`kTokensPerCta=2`，gate_up 偏好更大的 `kRowsPerCta`），在 ±20% 噪声下不足以据此改分派；
+要动之前先用 `--iters 20` 复测。
+
 
 ### 批量 prefill 内核的开发中真 bug
 

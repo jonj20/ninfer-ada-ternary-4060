@@ -382,11 +382,14 @@ void launch_ptq1_prefill_tile(const Tensor& x, const Weight& w, Tensor& out,
 }
 
 // PTQ1_0 批量 prefill 的准入条件与解码 GEMV 相同，外加 T 落在批量区间内。
-// T >= 4 而不是更高：serve 的 staged prefill 是按 9 个 token 一批调用线性层的（实测 T=9），
-// 阈值更高就会整条预填充都留在参考 t8 内核上。
+// T >= 2 而不是 4：投机验证的 T = draft + 1 取 2..4，而 T = 2/3 在这个函数里只有两个后备——
+// gemv_admits 只认 PQ2_0，PTQ1_0 会一路落到 launch_by_qtype<8> 的参考平铺内核（实测比 dp4a 慢
+// 一个量级）。门槛写成 4 就等于把 draft = 1/2 的验证钉在参考内核上：实测每轮 656/684 ms，而
+// draft = 3（T = 4 走得进这里）只要 212 ms。serve 的 staged prefill 是 9 个 token 一批，T = 2/3
+// 不影响它的选择。
 bool ptq1_prefill_admits(const Tensor& x, const Weight& w) {
     return w.qtype == QType::PTQ1_0_G128 && w.qhigh != nullptr && w.padded_shape[1] == w.k &&
-           (w.k % 128) == 0 && x.ne[1] >= 4;
+           (w.k % 128) == 0 && x.ne[1] >= 2;
 }
 
 void launch_ternary_gemm_t8(const Tensor& x, const Weight& w, Tensor& out,
@@ -401,12 +404,28 @@ void launch_ternary_gemm_t8(const Tensor& x, const Weight& w, Tensor& out,
     }
     if (ternary_ptq1_prefill_enabled() && ptq1_prefill_admits(x, w)) {
         if (prefill_q8_claim(w.k, x.ne[1], stream)) {
+            // grid.y = div_up(T, kTokensPerCta)，而同一 grid.x 的各个 y 会重读同一批权重行，所以
+            // kTokensPerCta 越大权重流量越大。在本卡的四个真实形状上实测（见
+            // tools/verify/ternary_gemv/prefill_tile_sweep.cu，单位与那套工具一致）：
+            //
+            //   T=2   <8,4,8,4> 20~42 GB/s  ->  <1,1,16,2> 60~126 GB/s
+            //   T=4   <8,4,8,4> 19~43 GB/s  ->  <1,1,16,4> 35~66 GB/s
+            //   T=9   <8,4,8,4> 最优，备选全部更差，所以 9..63 一律用它
+            //   T=16  <8,2,8,16> 比 <8,4,8,4> 慢 70~124%（kTokensPerCta=32 在 T=16 白浪费一半槽位）
+            //   T=32  <8,2,8,16> 比 <8,4,8,4> 慢 21~31%
+            //   T=64  两者持平
+            //
+            // 小 T 的瓶颈是 CTA 数与占用率：kRowsPerCta=64 时 n=17408 只有 80 个 CTA，退化成延迟
+            // 受限，而解码的 GEMV 约 142 GB/s。换成 R=1/TT=1/RG=16 后 kRowsPerCta=16、CTA 数
+            // 翻 4 倍。端到端每轮成本 192 -> 71 ms（draft=1）、212 -> 122 ms（draft=3）。
             if (x.ne[1] >= 64) {
                 launch_ptq1_prefill_tile<8, 4, 8, 16>(x, w, out, out_row_stride, stream);
-            } else if (x.ne[1] >= 16) {
-                launch_ptq1_prefill_tile<8, 2, 8, 16>(x, w, out, out_row_stride, stream);
-            } else {
+            } else if (x.ne[1] >= 9) {
                 launch_ptq1_prefill_tile<8, 4, 8, 4>(x, w, out, out_row_stride, stream);
+            } else if (x.ne[1] >= 3) {
+                launch_ptq1_prefill_tile<1, 1, 16, 4>(x, w, out, out_row_stride, stream);
+            } else {
+                launch_ptq1_prefill_tile<1, 1, 16, 2>(x, w, out, out_row_stride, stream);
             }
             return;
         }

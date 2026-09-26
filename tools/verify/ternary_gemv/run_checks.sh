@@ -7,6 +7,7 @@
 #   tools/verify/ternary_gemv/run_checks.sh bandwidth    # 只跑带宽
 #   tools/verify/ternary_gemv/run_checks.sh pattern      # 只跑访存归因
 #   tools/verify/ternary_gemv/run_checks.sh accuracy     # 只跑 int8 精度
+#   tools/verify/ternary_gemv/run_checks.sh tile         # 只跑 tile 形状扫描
 #
 # 环境变量：
 #   NINFER_ROOT   源码树根（含 src/ 与 CMakeLists.txt）；默认=本仓根
@@ -54,14 +55,16 @@ case "${which}" in
   bandwidth) build_with_engine gemv_bandwidth ;;
   accuracy)  build_with_engine activation_quant_accuracy ;;
   pattern)   build_standalone pattern_attribution ;;
+  tile)      build_with_engine prefill_tile_sweep ;;
   all)
     build_with_engine gemv_reference_check
     build_with_engine prefill_reference_check
     build_with_engine gemv_bandwidth
     build_with_engine activation_quant_accuracy
+    build_with_engine prefill_tile_sweep
     build_standalone pattern_attribution
     ;;
-  *) echo "未知参数：${which}（可用：reference|bandwidth|accuracy|pattern|all）" >&2; exit 2 ;;
+  *) echo "未知参数：${which}（可用：reference|bandwidth|accuracy|pattern|tile|all）" >&2; exit 2 ;;
 esac
 
 if [[ "${which}" == "reference" || "${which}" == "all" ]]; then
@@ -99,6 +102,12 @@ if [[ "${which}" == "accuracy" || "${which}" == "all" ]]; then
   echo
   echo "=== int8 激活精度（对照 bf16 路径）==="
   "${WORK_DIR}/activation_quant_accuracy"
+fi
+
+if [[ "${which}" == "tile" || "${which}" == "all" ]]; then
+  echo
+  echo "=== 批量内核 tile 扫描（只报数；有候选快 15% 以上会标出）==="
+  "${WORK_DIR}/prefill_tile_sweep"
 fi
 
 echo

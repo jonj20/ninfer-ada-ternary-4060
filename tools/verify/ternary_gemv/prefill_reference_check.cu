@@ -69,19 +69,15 @@ struct Shape {
 
 }  // namespace
 
-int main() {
-    constexpr int kR = 8, kTT = 4, kRG = 8, kTG = 16;
+// 引擎按 T 选 tile：T >= 64 用 kTokensPerCta = 64，T >= 16 用 32，T < 16 用 16。投机验证的
+// T = draft + 1 只有 2..4，落的是 T < 16 那个 tile，所以两个端点都要对拍——只测一个就等于另一条
+// 分支没有数值门禁。
+template <int kR, int kTT, int kRG, int kTG>
+int run_tile(const Shape* shapes, std::size_t count) {
     using Tile = ninfer::ops::detail::Ptq1PrefillTile<kR, kTT, kRG, kTG>;
-
-    const Shape shapes[] = {
-        {1, 128, 1, 1},    {1, 128, 1, 0},     {8, 128, 8, 1},     {8, 128, 8, 0},
-        {64, 512, 64, 1},  {64, 512, 64, 0},   {64, 640, 32, 1},   {64, 640, 37, 1},
-        {67, 640, 37, 1},  {64, 640, 128, 1},  {64, 640, 128, 0},  {67, 640, 37, 0},
-    };
-
-    std::printf("PTQ1_0 prefill 内核 vs CPU 参考（整表最大幅度归一，容差 2%% = bf16 舍入量级）\n");
     int failures = 0;
-    for (const Shape& s : shapes) {
+    for (std::size_t si = 0; si < count; ++si) {
+        const Shape s = shapes[si];
         const int groups = s.k / 128;
         std::vector<float> hx(static_cast<size_t>(s.k) * s.tokens);
         for (size_t i = 0; i < hx.size(); ++i) {
@@ -170,14 +166,35 @@ int main() {
         const double rms_ratio = std::sqrt(se_ref / n) / (std::sqrt(se_new / n) + 1e-30);
         const bool pass = rel < 0.02;
         if (!pass) { ++failures; }
-        std::printf("  rows=%-4d k=%-6d tokens=%-4d tail=%s  max_abs_err=%.3e (%.2e x max)  "
+        std::printf("  rows=%-4d k=%-6d tokens=%-4d tail=%s TG=%d  max_abs_err=%.3e (%.2e x max)  "
                     "RMS 比=%.5f  最差(token=%d,row=%d)  %s\n",
-                    s.rows, s.k, s.tokens, s.zero_tail ? "清零" : "生效", err, rel, rms_ratio,
+                    s.rows, s.k, s.tokens, s.zero_tail ? "清零" : "生效", kTG, err, rel, rms_ratio,
                     worst_t, worst_row, pass ? "PASS" : "FAIL");
 
         cudaFree(dx); cudaFree(dq); cudaFree(dqs); cudaFree(dc); cudaFree(dh); cudaFree(ds);
         cudaFree(dout);
     }
+    return failures;
+}
+
+int main() {
+    const Shape shapes[] = {
+        {1, 128, 1, 1},    {1, 128, 1, 0},     {8, 128, 8, 1},     {8, 128, 8, 0},
+        {64, 512, 64, 1},  {64, 512, 64, 0},   {64, 640, 32, 1},   {64, 640, 37, 1},
+        {67, 640, 37, 1},  {64, 640, 128, 1},  {64, 640, 128, 0},  {67, 640, 37, 0},
+        // 投机验证的 T = draft + 1：3 个值全部落在 T < 16 的 tile 上，用模型真实的 K 宽度。
+        {64, 5120, 2, 1},  {64, 5120, 3, 0},   {64, 5120, 4, 1},   {67, 5120, 2, 0},
+    };
+    const std::size_t count = sizeof(shapes) / sizeof(shapes[0]);
+
+    std::printf("PTQ1_0 prefill 内核 vs CPU 参考（整表最大幅度归一，容差 2%% = bf16 舍入量级）\n");
+    // 三档 tile 都要过门禁：T >= 64、T = 5..15，以及投机验证的 T = 2..4。
+    // 小 T 档是 R=1/TT=1/RG=16 那一族，kRowsPerCta 和 kThreads 都和旧配置不同，等于换了寄存器
+    // 布局与 CTA 形状，只测大 T 的 tile 等于让验证路径裸奔。
+    const int failures = run_tile<8, 4, 8, 16>(shapes, count) +   // T >= 64
+                         run_tile<8, 4, 8, 4>(shapes, count) +    // T = 5..15
+                         run_tile<1, 1, 16, 4>(shapes, count) +   // T = 3..4
+                         run_tile<1, 1, 16, 2>(shapes, count);    // T = 2
     if (failures == 0) {
         std::printf("prefill_reference: PASS\n");
         return 0;
