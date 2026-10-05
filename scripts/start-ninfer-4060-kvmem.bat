@@ -213,7 +213,7 @@ echo.
   --max-context %CTX% --kv-capacity %KVC% %RINGFLAG% ^
   --kvmem-budget %BUDGET% --kvmem-select %SELECT% ^
   --kv-dtype rk4v4-e8 ^
-  --max-concurrency 1 --default-max-tokens 131072 ^
+  --max-concurrency 1 --default-max-tokens 262144 ^
   --prefill-chunk %PRE% ^
   %HOSTKVFLAG% ^
   --device-state-slots 0 ^

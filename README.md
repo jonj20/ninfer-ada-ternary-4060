@@ -1,544 +1,202 @@
-# NInfer-4090 for Windows
+# NInfer Ternary KVMem for Windows
 
-A C++20/CUDA inference engine specialized for **one NVIDIA GeForce RTX 4090** (`sm_89`), built
-and run natively on **Windows 11** (MSVC + CUDA; no WSL, no Docker). It serves two 27B models of
-the same architecture through a CLI and an OpenAI- and Anthropic-compatible HTTP server:
+A C++20/CUDA inference engine for **one NVIDIA GeForce RTX 4060 Laptop** (`sm_89`), built and run
+natively on **Windows 11** (MSVC + CUDA; no WSL, no Docker). It serves Qwen3.8-27B and Ternary
+Bonsai 2 27B through a CLI and an OpenAI- and Anthropic-compatible HTTP server.
 
-| Model | Artifact | Size | Decode (MTP) | Best decode | Prefill (`pp2048`) |
-|---|---|---:|---:|---:|---:|
-| **Ternary Bonsai 2 27B** (Prism ML, ternary weights, text + vision) | [jgamboa/Ternary-Bonsai-2-27B-NInfer-4090](https://huggingface.co/jgamboa/Ternary-Bonsai-2-27B-NInfer-4090) | 6.4 GiB | **218 tok/s** | **532 tok/s** (MTP + n-gram) | **6,027 tok/s** |
-| **Qwen3.8-27B, int8 prefill** (recommended) | [jgamboa/Qwen3.8-27B-NInfer-4090](https://huggingface.co/jgamboa/Qwen3.8-27B-NInfer-4090) | 19.0 GiB | **120 tok/s** | **289 tok/s** (MTP + n-gram) | **5,790 tok/s** |
-| **Qwen3.8-27B**, official artifact | [neroued/Qwen3.8-27B-NInfer](https://huggingface.co/neroued/Qwen3.8-27B-NInfer) | 19.0 GiB | 120 tok/s | 289 tok/s; 211 tok/s (DFlash2, code) | 2,762 tok/s |
-| **Swift 1.5 Qwen3.8-27B** (UkisAI fine-tune that thinks less), int8 prefill | [jgamboa/Swift-1.5-Qwen3.8-27B-NInfer-4090](https://huggingface.co/jgamboa/Swift-1.5-Qwen3.8-27B-NInfer-4090) | 19.0 GiB | same as Qwen3.8 | 27 % fewer tokens per answer on hard problems, same accuracy | same as Qwen3.8 int8 |
+**KVMem** is the feature that makes an 8 GB card usable at long context: the logical context may be
+far larger than the pool that stays resident on the GPU, and each round retrieves the window it
+needs. Measured on an RTX 4060 Laptop (8188 MiB) with
+`scripts/start-ninfer-4060-kvmem.bat`: **258,939 tokens** prefilled and generated in one request
+(364 s, no `context_length_exceeded`, 37 tok/s decode without MTP) while Device KV residency fell
+from 1024 pages (65,536 tokens) to 559 and Host KV grew to 3.89 GiB. The same context placed
+densely needs 4.25 GiB of KV plus 5.52 GiB of weights and does not fit.
 
-The two Qwen3.8-27B files hold the same weights, byte for byte; the int8-prefill file lets prompt
-processing run on int8 tensor cores (1.7-1.9x faster, same decode, same quality within noise).
-Against the official llama.cpp on the same card with the same Qwen3.8-27B BF16 checkpoint
-(Q4_K_M GGUF), NInfer prefills 1.8-2.0x faster and decodes 1.1x faster without speculation and
-1.2-1.3x faster with MTP 3 ([comparison](#qwen38-27b)).
-
-Swift 1.5 is a separate fine-tune of Qwen3.8-27B by UkisAI, trained to avoid overthinking. With
-the model card's sampling and thinking on, it used 27 % fewer tokens than base Qwen3.8 on six hard
-problems (three seeds each, 18/18 correct for both), mostly by cutting the longest reasonings;
-decode was slightly faster (129.8 against 121.8 tok/s) thanks to higher MTP acceptance
-([WINDOWS_PORT.md](WINDOWS_PORT.md#sampled-comparison-swift-15-against-base-2026-09-26)). Its
-license limits commercial use above a revenue threshold; see the model card.
-
-Every figure in this README was measured on the same RTX 4090 under Windows unless it says
-otherwise; the conditions are next to each table. Both models run the full 262K-token context on
-24 GB.
+Ternary Bonsai 2 27B (Prism ML, ternary weights, text + vision, 6.4 GiB) is the recommended model
+here. The Qwen3.8-27B artifacts are 19.0 GiB and need KVMem + a Host KV tier on this card; the
+int8-prefill one runs prompt processing on int8 tensor cores. **Every figure below was measured on
+an RTX 4060 Laptop (8188 MiB) under Windows 11.**
 
 - [Quick start](#quick-start)
-- [Performance](#performance)
-- [Choosing settings](#choosing-settings)
-- [Benchmarking and validation](#benchmarking-and-validation)
-- [How it works](#how-it-works)
-- [Converting models](#converting-models)
-- [Serving](#serving)
+- [Measured performance](#measured-performance)
+- [Settings](#settings)
 - [Limits](#limits)
-- [Documentation](#documentation)
-- [Lineage and credits](#lineage-and-credits)
+- [Further reading](#further-reading)
 
 ## Quick start
 
-### Requirements
-
 | | |
 |---|---|
-| GPU | NVIDIA GeForce RTX 4090, 24 GB (`sm_89`). The build targets this card only. |
+| GPU | RTX 4060 Laptop, 8188 MiB (`sm_89`). The build targets this card only. |
 | OS | Windows 11 x64 |
-| Toolchain | Visual Studio Build Tools with MSVC (2026 validated), CUDA 12.8 or newer (13.4 validated), CMake 3.28+, Ninja |
-| Libraries | [vcpkg](https://github.com/microsoft/vcpkg) (`curl`, `ffmpeg`, `pkgconf`, installed from the manifest) |
-| Download tool | [`hf`](https://huggingface.co/docs/huggingface_hub/guides/cli) (`pip install -U huggingface_hub`) or a browser |
+| Toolchain | MSVC Build Tools (2026 validated), CUDA 12.8+ (13.4 validated), CMake 3.28+, Ninja |
+| Libraries | [vcpkg](https://github.com/microsoft/vcpkg) (`curl`, `ffmpeg`, `pkgconf`) |
+| Download tool | [`hf`](https://huggingface.co/docs/huggingface_hub/guides/cli) |
 
-### 1. Get the binaries
+### Prebuilt
 
-**Prebuilt (easiest):** download `ninfer-4090-windows-x64-<date>.zip` from the
-[latest release](https://github.com/JGamboa/ninfer-4090-windows/releases/latest) and unzip it.
-It needs only an NVIDIA driver 595 or newer and the
-[VC++ 2015-2022 x64 redistributable](https://aka.ms/vs/17/release/vc_redist.x64.exe): the CUDA
-runtime is built into the executables, and the zip includes the DLLs, two server launchers and
-the licenses. Skip to step 2.
+Download `ninfer-4060-windows-x64-<date>.zip` from the
+[latest release](https://github.com/JGamboa/ninfer-4060-windows/releases/latest). It needs only an
+NVIDIA driver 595+ and the
+[VC++ 2015-2022 x64 redistributable](https://aka.ms/vs/17/release/vc_redist.x64.exe); CUDA is
+statically linked.
 
-**Or build from source** from a "x64 Native Tools" prompt (or after running `vcvars64.bat`) with
-CUDA on `PATH`:
+### Build from source
 
 ```bat
-git clone https://github.com/JGamboa/ninfer-4090-windows
-cd ninfer-4090-windows
-cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release ^
-  -DCMAKE_TOOLCHAIN_FILE=C:/vcpkg/scripts/buildsystems/vcpkg.cmake ^
-  -DVCPKG_TARGET_TRIPLET=x64-windows -DCMAKE_CUDA_ARCHITECTURES=89
-cmake --build build -j
+git clone https://github.com/jonj20/ninfer-kvmem-ternary-4060
+cd ninfer-kvmem-ternary-4060
+scripts\build_4060_win.bat
 ```
 
-This produces `build\apps\ninfer.exe` (CLI), `build\apps\ninfer-serve.exe` (HTTP server) and
-`build\apps\ninfer-perplexity.exe`. Add `-DNINFER_BUILD_BENCHMARKS=ON -DBUILD_TESTING=ON` to also
-build the benchmarks and tests. At runtime, put `build\vcpkg_installed\x64-windows\bin` and the
-CUDA `bin` directory on `PATH`. Build details and the Windows-specific changes are in
-[WINDOWS_PORT.md](WINDOWS_PORT.md).
+The script locates MSVC, CUDA, vcpkg and Ninja, then configures and builds into `build_4060\`.
+It is incremental by default and accepts `-configure`, `-clean` and `-jobs N`; the toolchain paths
+are constants at the top of the script. Produces `build_4060\apps\ninfer.exe`,
+`build_4060\apps\ninfer-serve.exe` and `build_4060\apps\ninfer-perplexity.exe`. See
+[WINDOWS_PORT.md](WINDOWS_PORT.md) for the Windows-specific changes.
 
-### 2. Download a model
+### Download a model
 
 ```bat
-:: Ternary Bonsai 2 27B: text + vision + MTP head (6.4 GiB)
 hf download jgamboa/Ternary-Bonsai-2-27B-NInfer-4090 bonsai2_27b_vl_mtp_q4q5.ninfer --local-dir E:\LLM
-
-:: Qwen3.8-27B with int8 prefill: text + vision + MTP + DFlash2 (19.0 GiB)
-hf download jgamboa/Qwen3.8-27B-NInfer-4090 qwen3_8_27b_a8.ninfer --local-dir E:\LLM
-
-:: or the official Qwen3.8-27B artifact (same weights, BF16 prefill)
-hf download neroued/Qwen3.8-27B-NInfer qwen3_8_27b.ninfer --local-dir E:\LLM
 ```
 
-Any folder works; the examples below use `E:\LLM`. The Bonsai repository also has
-`bonsai2_27b_vl.ninfer`, the same model with a Q8 MTP layer (3.5-4.8 % slower decode). Verify
-each download against the checksums on its model card.
+Verify each download against the checksums on its model card.
 
-### 3. Run from the command line
+### Command line
 
 ```bat
-build\apps\ninfer.exe E:\LLM\bonsai2_27b_vl_mtp_q4q5.ninfer ^
+build_4060\apps\ninfer.exe E:\LLM\bonsai2_27b_vl_mtp_q4q5.ninfer ^
   --prompt "Write a Python function that merges two sorted lists." ^
   --max-context 8192 --max-new 1024 --spec mtp --draft-tokens 2 --lm-head-draft
-
-build\apps\ninfer.exe E:\LLM\qwen3_8_27b_a8.ninfer ^
-  --prompt "Write a Python function that merges two sorted lists." ^
-  --max-context 8192 --max-new 1024 --spec mtp --draft-tokens 3 --lm-head-draft --ngram chain
 ```
 
-The CLI prints the answer, then a summary with prefill and decode speed, MTP acceptance and memory
-use. Both models think by default; add `--no-thinking` or `--reasoning-effort low|medium|xhigh`.
-Chat histories, images and video go through `--messages FILE.json` (examples in
-[examples/cli/messages](examples/cli/messages)). `ninfer.exe --help` and [docs/cli.md](docs/cli.md)
-list every option.
+The summary reports prefill and decode speed, MTP acceptance and memory use. Chat histories,
+images and video go through `--messages FILE.json`
+([examples/cli/messages](examples/cli/messages)). All options: `ninfer.exe --help`,
+[docs/cli.md](docs/cli.md).
 
-### 4. Run the server
-
-Ternary Bonsai 2 27B, full 262K context per request, three concurrent requests, vision on:
+### Server
 
 ```bat
-build\apps\ninfer-serve.exe E:\LLM\bonsai2_27b_vl_mtp_q4q5.ninfer ^
-  --host 127.0.0.1 --port 8080 --model-id bonsai-27b ^
-  --max-context 262144 --kv-capacity auto --kv-dtype rk4v4-e8 --max-concurrency 3 ^
-  --spec mtp --draft-tokens 2 --lm-head-draft --ngram chain --vision
-```
-
-Qwen3.8-27B, 100K context, three concurrent requests:
-
-```bat
-build\apps\ninfer-serve.exe E:\LLM\qwen3_8_27b_a8.ninfer ^
+build_4060\apps\ninfer-serve.exe E:\LLM\qwen3_8_27b_a8.ninfer ^
   --host 127.0.0.1 --port 8080 --model-id qwen3.8-27b ^
-  --max-context 100000 --kv-capacity 100000 --kv-dtype rk4v4-e8 --max-concurrency 3 ^
+  --max-context 100000 --kv-capacity 65536 --kv-ring --kvmem-budget 32768 ^
+  --kv-dtype rk4v4-e8 --max-concurrency 3 ^
   --max-pending-requests 10 --pending-timeout-ms 600000 --prefill-chunk 1408 ^
   --spec mtp --draft-tokens 3 --lm-head-draft --ngram chain --preserve-thinking ^
   --device-state-slots 3 --host-state-slots 4 --host-kv-mib 4096
 ```
 
-These are the configurations the author runs daily. The server checks the memory plan before it
-listens, so a configuration that does not fit fails at startup, not at request time.
+The memory plan is checked before the socket opens, so an infeasible configuration fails at startup
+rather than at request time.
 
-- API base URL: `http://127.0.0.1:8080/v1` (OpenAI Chat Completions and Responses) and
-  `http://127.0.0.1:8080/v1/messages` (Anthropic Messages). Use `--host 0.0.0.0` to serve the
-  local network and `--api-key KEY` to require a key.
-- Live monitor: open `http://127.0.0.1:8080/monitor` in a browser for decode and prefill speed,
-  draft acceptance, prefix-cache reuse, KV occupancy, slots and recent requests.
-- Prometheus metrics at `/metrics`, a llama.cpp-style slot table at `/slots`.
+- `http://127.0.0.1:8080/v1` (OpenAI Chat Completions, Responses) and
+  `http://127.0.0.1:8080/v1/messages` (Anthropic Messages).
+- `/monitor` dashboard, `/metrics` (Prometheus), `/slots` (llama.cpp-style table).
 
-A first request from PowerShell:
+## Measured performance
 
-```powershell
-$body = @{ model = "bonsai-27b"; max_tokens = 512
-           messages = @(@{ role = "user"; content = "Explain CUDA graphs in three sentences." }) } | ConvertTo-Json -Depth 5
-Invoke-RestMethod -Uri http://127.0.0.1:8080/v1/chat/completions -Method Post `
-  -ContentType "application/json" -Body $body | Select-Object -ExpandProperty choices
+`scripts\start-ninfer-4060-kvmem.bat` with `bonsai2_27b_vl_mtp_q4q5.ninfer`, Windows 11, CUDA 13.4,
+no display attached. The script defaults to `-drafts 0` and a 32,768-token window.
+
+```bat
+scripts\start-ninfer-4060-kvmem.bat
+scripts\start-ninfer-4060-kvmem.bat -select retrieval
 ```
-
-Any OpenAI- or Anthropic-compatible client (OpenCode, Claude Code through a proxy, LiteLLM, Open
-WebUI, the `openai` Python package) works with the same URL.
-
-## Performance
-
-Conditions for every table: RTX 4090 at stock clocks, Core i9-13900K, Windows 11, driver 595.97,
-CUDA 13.4, greedy decoding unless noted. Since 2026-09-27 the monitor runs on the CPU's integrated
-graphics and the 4090 has no display; older rows say when the 4090 also drove the desktop, which
-costs up to 15-18 % of decode ([below](#when-the-4090-also-drives-the-display)).
-
-### Ternary Bonsai 2 27B
-
-Against Prism's own llama.cpp fork (build b10709, `Ternary-Bonsai-2-27B-PTQ1_0.gguf`) on the same
-machine:
-
-| Measurement | NInfer | Prism llama.cpp fork |
-|---|---:|---:|
-| Decode, no speculation (`tg128`) | **129 tok/s** | — |
-| Decode, no speculation (`tg128`), 2026-09-24, monitor on the 4090 in both | **101 tok/s** | 77 tok/s |
-| Decode, MTP 2, mean of six mixed prompts, thinking off | **218 tok/s** | — |
-| Decode, MTP 2, prose / edit-style prompts | 167 / 250 tok/s | — |
-| Decode, MTP 2 + n-gram, edit-style prompts | **532 tok/s** | — |
-| Decode, three concurrent requests, aggregate | **360 tok/s** | — |
-| Prefill, `pp512` / `pp2048` | **5,793 / 6,027 tok/s** | 1,363 tok/s / — |
-| Prefill, 8K / 64K / 128K-token prompt (needle test, answer exact) | 1.3 s / 14.4 s / 37.4 s | — |
-| Perplexity, wikitext / code corpus | 8.087 / 1.895 | 8.178 / 1.899 |
-| Task quality, 45 deterministic tasks (`tools/eval`) | 43/45 | — |
-| Weights in VRAM (text / + vision) | 6.11 / 6.39 GiB | 5.53 GiB (text) |
-
-- Decode depends on the text: drafts are accepted more often in predictable output. Edit-style
-  prompts (return a file, a JSON list or a document with a small change) restate their input.
-- Prism's model card says its PQ2_0 packing processes prompts faster than PTQ1_0, so part of the
-  prefill gap is the file format.
-- The `tg128`, six-prompt MTP 2 and 64K rows were measured on 2026-09-27 with the 4090 headless
-  (item 32); the other prefill rows on 2026-09-27 (items 26-29) with a 4K60 dummy display, which
-  measured the same. The Prism fork comparison, the prose / edit-style rows, n-gram and concurrent
-  decode are from 2026-09-24/25, when the card also drove a real 4K monitor.
-- Sources: [Bonsai design notes](docs/maintainer/bonsai-ternary-design.md), section 9.1
-  (items 14-32).
-
-### Qwen3.8-27B
 
 | Measurement | Result |
 |---|---:|
-| Decode, no speculation (`tg128`) | 54.7 tok/s |
-| Decode, MTP 3, mean of six mixed prompts, thinking off | **120 tok/s** |
-| Decode, MTP 3, mean of six mixed prompts, thinking on (2026-09-25) | 107 tok/s |
-| Decode, MTP 3, code prompt, thinking off (server) | 149 tok/s |
-| Decode, DFlash2 draft 12, code prompt, thinking off | **211 tok/s** |
-| Decode, MTP 3 + n-gram, edit-style prompts, thinking off | **289 tok/s** |
-| Decode, MTP 3 + n-gram, 7K-11K-token file edits through the server, thinking on | 258 tok/s |
-| Prefill, `pp512` / `pp2048`, official artifact / int8 artifact | 2,536 / 2,762 tok/s, **5,339 / 5,790 tok/s** |
-| Prefill, 8K / 64K / 128K-token prompt, official artifact (needle test, answer exact) | 2.9 s / 27.4-27.6 s / 64.0 s |
-| Prefill, 8K / 64K / 128K-token prompt, int8 artifact (needle test, answer exact) | **1.5 s / 14.8 s / 41.8 s** |
-| Perplexity, quick four-corpus run, official / int8 artifact | 4.8007 / 4.7944 |
-| Task quality, 45 deterministic tasks (`tools/eval`) | 44/45 (2026-09-25); 45/45 on both artifacts (2026-09-26) |
+| Decode, no MTP | **37 tok/s** |
+| Logical context prefilled and generated in one request | **258,939 tokens** |
+| Wall time | 364 s |
+| `context_length_exceeded` | none |
+| Fact placed at the start, slid out of the window | still answered correctly |
+| Device KV pages, start to end | 1024 -> 559 (pool cap 1024 = 65,536 tokens) |
+| Host KV at end | 3.89 GiB |
+| Prefill throughput, average vs peak | 711 against 1020 tok/s |
 
-The **int8 artifact** (`qwen3_8_27b_a8.ninfer`) holds the same weights as the official one, byte
-for byte, and allows the prefill GEMMs to quantize their activations to int8 (per token and per 64
-channels) and run on int8 tensor cores; decode is unchanged. It is built from the official file in
-a few minutes, without a BF16 checkpoint ([conversion](#converting-models)).
+Config: `--max-context 262144 --kv-capacity 65536 --kv-ring --kvmem-budget 32768`. A 36,639-token
+run gave the same answer after two window slides.
 
-Against the official llama.cpp on the same machine, both engines starting from the official
-Qwen3.8-27B BF16 checkpoint (llama.cpp `a894dae`, Q4_K_M GGUF of 15.65 GiB with its MTP layer, q8_0
-KV and flash attention; NInfer int8-prefill artifact, int8 KV; measured 2026-09-27):
+For per-model tok/s, measure locally with `build_4060\bench\ninfer_bench.exe` rather than trusting a
+number from another card; see [bench/README.md](bench/README.md).
 
-| Measurement | llama.cpp | NInfer | Ratio |
-|---|---:|---:|---:|
-| Prefill `pp512` / `pp2048` | 2,723 / 2,676 tok/s | **4,777 / 5,124 tok/s** | 1.75x / 1.91x |
-| Prefill, 8K / 64K / 128K-token prompt | 3.0 / 30.7 / 75.9 s | **1.5 / 16.5 / 41.8 s** | 2.0x / 1.9x / 1.8x |
-| Decode, no speculation (six prompts) | 43.0 tok/s | **48.1 tok/s** | 1.12x |
-| Decode, MTP 3 (six prompts) | 87.1 tok/s | **106.4 tok/s** | 1.22x |
-| Decode, MTP 3, 30K-token document | 66.8 tok/s | **87.2 tok/s** | 1.31x |
+## Settings
 
-Greedy, thinking off, 8-bit KV in both; every needle answer exact. Both engines ran in the same
-session, which was about 10 % slower in absolute terms than a cool, idle card: rerun alone later,
-the NInfer build measured `pp512` / `pp2048` 5,339 / 5,790 tok/s, `tg128` 54.7 tok/s and the 64K
-prompt in 14.8 s. Full method, per-prompt figures and the earlier comparisons:
-[docs/llamacpp-comparison.md](docs/llamacpp-comparison.md).
-
-### Speculative decoding by workload
-
-Decode tok/s, KV `rk4v4-e8`:
-
-| Workload | Bonsai MTP 2 | Bonsai MTP 2 + n-gram | Qwen3.8 MTP 3 | Qwen3.8 MTP 3 + n-gram | Qwen3.8 DFlash2 d6 |
-|---|---:|---:|---:|---:|---:|
-| CLI, edit-style prompts, thinking off | 250 | **532** | 152 | **289** | 215 |
-| CLI, prose, thinking off | 167 | 167 | 97 | 97 | 96 |
-| Server, edit-style prompts, thinking on | 212 | **319** | — | 165 | 169 |
-| Server, edit of a 7K-11K-token file, thinking on | 215 | **378** | — | **258** | 139 |
-
-CLI rows: one request, greedy, up to 1024 tokens. Server rows: `ninfer-serve` with the launcher
-flags above (three lanes, sampling and thinking defaults), one request at a time.
-
-## Choosing settings
-
-**Speculation.** Every drafted token is verified by the model, so the output distribution does
-not change; only the speed does.
-
-| Model | Recommended | When to change |
-|---|---|---|
-| Bonsai | `--spec mtp --draft-tokens 2 --lm-head-draft --ngram chain` | `--draft-tokens 3` is up to 18 % faster on code and math and about 10 % slower on prose |
-| Qwen3.8 | `--spec mtp --draft-tokens 3 --lm-head-draft --ngram chain` | `--spec dflash2 --draft-tokens 6` is faster on free-form prose (99 against 85 tok/s through the server); `--draft-tokens 12` peaks at 211 tok/s on code. DFlash2 loads 1.6 GiB more weights; with three lanes, `--no-cuda-graph` frees about 1.1 GiB of graph memory for about 4 % of decode speed |
-
-`--ngram chain` extends each MTP proposal with text copied from the context, so rounds that
-reproduce code, JSON, tool calls or documents accept 10 or more tokens. It costs a second set of
-CUDA graphs (about 2.5 % of the KV pool) and changes nothing on text with nothing to copy.
-[docs/cli.md](docs/cli.md#speculative-decoding) lists the `--ngram-*` options.
+**Speculation.** Drafted tokens are verified by the model, so quality is unchanged and only speed
+moves. Bonsai: `--spec mtp --draft-tokens 2 --lm-head-draft --ngram chain`. Qwen3.8:
+`--draft-tokens 3`. `--draft-tokens 3` is faster on code and math, slower on prose. DFlash2 is
+faster on prose but loads 1.6 GiB more weights, which is tight at 8 GB, and it does not support
+Bonsai's ternary output head. `--ngram chain` copies context text into drafts (useful for code, JSON
+and tool calls) at the cost of a second set of CUDA graphs.
 
 **KV cache.**
 
 | `--kv-dtype` | Use it for |
 |---|---|
-| `rk4v4-e8` (4-bit E8-lattice keys, 4-bit values) | Default. Full 262K context with vision; retrieval exact through 260K |
-| `int8` | Maximum precision; Qwen3.8 fits about 168K tokens text-only |
-| `rk2v4-e8` | More headroom at 262K (2-bit keys); about 10 % slower decode |
+| `rk4v4-e8` (4-bit E8-lattice keys, 4-bit values) | Default here. Best balance for 8 GB. |
+| `rk2v4-e8` | More headroom (2-bit keys), about 10 % slower decode |
+| `int8` | Maximum precision; very tight with Qwen3.8 |
 
-**Context and lanes.** `--max-context` bounds one request; `--kv-capacity` sizes the KV pool
-shared by all lanes (`auto` takes what fits). `--max-concurrency` (one to eight) sets the lanes;
-three are measured on both models. Prefill runs one request at a time, so a long prompt delays the
-first token of other requests. `--kvmem-budget N` (multiples of 128; `0` keeps the whole context
-resident) bounds the Device KV window to a sink prefix plus the newest tail and keeps the rest of
-the history in the pinned Host KV tier, letting one prompt reach `--max-context` even when
-`--kv-capacity` only holds the window. It requires `--kv-capacity` to cover the budget plus one
-`--prefill-chunk`; `--spec` disables it, and it creates no new reusable checkpoints, so requests
-that reuse a cached prefix remain bounded by `--kv-capacity`.
+**KVMem.** `--kvmem-budget N` (default 32768, `0` disables windowing) bounds the Device KV window to
+a sink prefix plus the newest tail and keeps the rest in the pinned Host KV tier.
+`--kvmem-select recency|retrieval` picks the blocks: `retrieval` scores each historical block by
+mean-key similarity to the newest completed block, which lets a block outside the tail return. It
+needs a nonzero budget and is ignored while `--spec` runs.
 
-**Sampling.** The server applies the model card defaults: `temperature 1.0, top_p 0.95, top_k 20`
-with thinking, and `temperature 0.7, top_p 0.80, top_k 20, presence_penalty 1.5` without.
-Requests and startup flags (`--temperature`, `--top-p`, ...) override them.
+| Constraint | Why |
+|---|---|
+| `--kv-capacity >= budget + --prefill-chunk` | window plus the chunk in flight must fit |
+| `--kv-capacity < --max-context` requires `--kv-ring` | otherwise startup rejects the pool |
+| Host KV tier required | a demoted page needs a Host replica; `--host-kv-mib 4096` sufficed at 256K |
 
-### When the 4090 also drives the display
+`gen_reserve` is derived: `gen_reserve = --kv-capacity - --kvmem-budget`. It adds no reusable
+checkpoints, so prefix-reusing requests stay bounded by `--kv-capacity`.
 
-If the RTX 4090 also drives your monitor, the Windows desktop compositor takes the GPU from CUDA on
-every frame. With a 3840x2160 desktop this cost 18 % of each MTP decode round at 120 Hz and 15 % at
-60 Hz. For the best decode speed, connect the monitor to the motherboard (integrated graphics) or
-another GPU; otherwise use 60 Hz and keep animated windows still while generating. A static
-desktop nobody uses (a dummy display plug at 4K60) cost nothing measurable in prefill or `tg128`.
-Compare tok/s only between runs with the same display setup.
+**Concurrency.** `--max-concurrency` (1-8) sets the lanes; two lanes is a practical maximum for
+Bonsai, one for Qwen3.8 with KVMem. Prefill runs one request at a time, so a long prompt delays the
+other lanes.
 
-## Benchmarking and validation
-
-Build with `-DNINFER_BUILD_BENCHMARKS=ON -DBUILD_TESTING=ON`. Close `ninfer-serve` first, and run
-each A/B comparison alternating the two binaries (old, new, new, old) so thermal and display
-effects cancel. All commands run from the repository root.
-
-**Throughput** (`ninfer_bench`, the public Engine route: `pp` = prefill, `tg` = decode):
-
-```bat
-build\bench\ninfer_bench.exe --weights E:\LLM\qwen3_8_27b.ninfer -p 512,2048 -n 128 -r 3 --kv-dtype int8
-build\bench\ninfer_bench.exe --weights E:\LLM\bonsai2_27b_vl_mtp_q4q5.ninfer -n 128 -r 3 ^
-  --spec mtp --draft-tokens 2 --lm-head-draft
-```
-
-`-o json --output-file FILE` writes a machine-readable report; see [bench/README.md](bench/README.md).
-
-**Decode on real prompts** (the six-prompt protocol behind the decode means above; read `decode
-speed` and `mtp acceptance rate` from the summary):
-
-```bat
-build\apps\ninfer.exe E:\LLM\qwen3_8_27b.ninfer --prompt "Explain how a transformer language model generates text, step by step." ^
-  --max-context 4096 --max-new 512 --greedy --spec mtp --draft-tokens 3 --lm-head-draft
-```
-
-**Long-context prefill and retrieval** (needle in a haystack; the answer must contain
-`ORCHID=493817`; prompts at 8K, 64K, 128K and 256K):
-
-```bat
-build\apps\ninfer.exe E:\LLM\bonsai2_27b_vl_mtp_q4q5.ninfer --messages examples\cli\messages\long_niah_64k.json ^
-  --max-context 262144 --prefill-chunk 1024 --kv-dtype rk4v4-e8 --no-thinking --max-new 16 --greedy ^
-  --spec mtp --draft-tokens 2 --lm-head-draft
-```
-
-**Perplexity** (four corpora; `--quick` takes one stream per corpus, about two minutes):
-
-```bat
-build\apps\ninfer-perplexity.exe E:\LLM\qwen3_8_27b.ninfer --corpus eval\corpora\perplexity-1m\manifest.json ^
-  --quick --kv-dtype bf16 --output E:\eval\ppl_qwen38
-```
-
-See [docs/perplexity.md](docs/perplexity.md) for full runs and long-context scoring.
-
-**Task quality** (45 deterministic tasks against a running server: tool calls, JSON, Python,
-math, instruction following, Spanish, 4K-32K retrieval):
-
-```powershell
-python -m tools.eval run --base-url http://127.0.0.1:8080/v1 --label qwen38 --out E:\eval\qwen38.json --thinking off
-python -m tools.eval compare E:\eval\bonsai.json E:\eval\qwen38.json --markdown E:\eval\compare.md
-```
-
-See [tools/eval/README.md](tools/eval/README.md).
-
-**Tests.** `ctest --test-dir build --output-on-failure` runs the suite. Every CUDA kernel is
-checked against an independent FP32/FP64 oracle; for example `build\tests\ninfer_linear_t5_test.exe`
-(ternary GEMM/GEMV) and `build\tests\ninfer_softmax_attention_test.exe` (attention, all KV
-modes). Tests that load a real model are opt-in; see [tests/README.md](tests/README.md).
-
-**Profiling.** `nsys profile --trace=cuda,nvtx` on `ninfer_bench` or the CLI attributes time by
-kernel; Nsight Compute (`ncu`) answers per-kernel questions. The Op benchmarks under
-`build\bench\ninfer_*_bench.exe` (for example `ninfer_t5_bench`, `ninfer_q4_linear_swiglu_bench`)
-time one kernel family at real shapes.
-
-## How it works
-
-NInfer is a from-scratch engine for one architecture family (Qwen3.5/3.6/3.8: 48 Gated DeltaNet
-linear-attention layers and 16 full-attention layers at 27B). There is no generic graph: each
-layer runs explicit kernels selected for its weight format, and every decode round replays as one
-CUDA graph.
-
-- **Ternary weights (Bonsai).** Prism's ternary codes are stored as scaled base 3, five weights
-  per byte, with one FP16 scale per 128 weights (`t5_g128_fp16`, 1.75 bits per weight). Decode
-  quantizes activations to int8 and multiplies with `dp4a`; prefill and multi-token verification
-  use int8 tensor cores (`m16n8k32`), with a pipelined kernel for the tall projections that
-  overlaps tensor-core work with the ternary decode. Prism's Hadamard rotation is fused into the
-  activation quantization.
-- **Groupwise weights (Qwen3.8).** Q4/Q5 codes with one FP16 scale per 64 weights, dequantized in
-  shared memory for BF16 tensor-core GEMMs, with K-split routes for the 5-16-token verification
-  band of DFlash2. Prefill runs pipelined one-CTA-per-SM GEMMs; with the int8 artifact the codes
-  feed int8 tensor cores directly against per-token, per-64-channel int8 activations.
-- **Speculative decoding.** MTP uses the model's own multi-token-prediction layer (Bonsai borrows
-  Qwen3.8's, which shares its architecture); DFlash2 is a separate drafter; the n-gram pool
-  (16 MiB, 8-token keys) extends MTP drafts with text from the context, up to 15 tokens per round.
-  The linear-attention state rolls back rejected tokens through ReplaySSM records.
-- **Long context.** Paged KV in int8 or E8-lattice 4-bit/2-bit codes, a warp-specialized prompt
-  attention kernel (producer warps score, worker warps accumulate), and decode attention splits
-  sized for whole waves of the 128 SMs.
-- **Serving.** A fixed number of lanes (one to eight) decode as one batch; prefixes of previous
-  requests are reused from device memory, host memory or disk.
-
-The ternary work (converter, format, kernels, measurements and every design decision) is
-documented in the [Bonsai design notes](docs/maintainer/bonsai-ternary-design.md) and the
-[conversion guide](docs/maintainer/bonsai-ternary-conversion.md). Engine internals are in
-[docs/maintainer/engine-architecture.md](docs/maintainer/engine-architecture.md).
-
-## Converting models
-
-The converter is Python (3.11 or 3.12) with NumPy, safetensors and PyTorch; it runs on Windows and
-uses the GPU when `--device cuda` is given:
-
-```bat
-python -m venv .venv
-.venv\Scripts\activate
-python -m pip install numpy safetensors
-python -m pip install torch --index-url https://download.pytorch.org/whl/cu128
-```
-
-**Ternary Bonsai 2 27B from Prism's GGUF.** Download `Ternary-Bonsai-2-27B-PTQ1_0.gguf` and, for
-images, `Ternary-Bonsai-2-27B-mmproj-Q8_0.gguf` from
-[prism-ml/Ternary-Bonsai-2-27B-gguf](https://huggingface.co/prism-ml/Ternary-Bonsai-2-27B-gguf),
-and `qwen3_8_27b.ninfer` (it supplies the tokenizer, chat template and MTP head). About three
-minutes:
-
-```bat
-python -m tools.convert.bonsai_base --gguf E:\LLM\Ternary-Bonsai-2-27B-PTQ1_0.gguf ^
-  --reference E:\LLM\qwen3_8_27b.ninfer ^
-  --mmproj E:\LLM\Ternary-Bonsai-2-27B-mmproj-Q8_0.gguf --out E:\LLM\bonsai2-27b-vl
-python -m tools.convert --model E:\LLM\bonsai2-27b-vl --recipe bonsai2_27b_mtp_q4q5 ^
-  --components text,vision,mtp --source gguf=E:\LLM\Ternary-Bonsai-2-27B-PTQ1_0.gguf ^
-  --source mmproj=E:\LLM\Ternary-Bonsai-2-27B-mmproj-Q8_0.gguf ^
-  --source mtp=E:\LLM\qwen3_8_27b.ninfer --proposal --name bonsai2-27b ^
-  --out E:\LLM\bonsai2_27b_vl_mtp_q4q5.ninfer --device cuda
-```
-
-Leave out `--mmproj`, `vision` and `--source mmproj=...` for a text-only artifact. The recipe keeps
-Prism's ternary codes bit-exact.
-
-**Qwen3.8-27B fine-tunes from BF16 safetensors.** Any checkpoint with the Qwen3.8-27B
-configuration converts with the official recipe, including its MTP layer; add the DFlash2
-drafter from [z-lab/Qwen3.8-27B-DFlash2](https://huggingface.co/z-lab/Qwen3.8-27B-DFlash2) if you want `--spec
-dflash2`. A 55 GB BF16 checkpoint converts in about 100 s:
-
-```bat
-python -m tools.convert --model E:\LLM\my-qwen38-finetune --recipe qwen3_8_27b ^
-  --source dflash2=E:\LLM\dflash2-src --components text,vision,mtp,dflash2 ^
-  --resource chat_template.jinja=tools/chat_templates/qwen3_8.jinja --proposal ^
-  --name my-qwen38 --out E:\LLM\my_qwen38.ninfer --device cuda
-```
-
-Use NInfer's `qwen3_8.jinja` template: it adds developer and mid-conversation system messages
-and tool-result handling that agent clients need.
-
-**Qwen3.8 int8 prefill artifact.** A ready-made file is on
-[jgamboa/Qwen3.8-27B-NInfer-4090](https://huggingface.co/jgamboa/Qwen3.8-27B-NInfer-4090). To
-build it yourself: the `qwen3_8_27b_a8` recipe copies an existing
-`qwen3_8_27b.ninfer` word for word and only grants int8 activations to the prefill GEMMs. It needs
-a configuration directory (the Qwen3.8 `config.json` and tokenizer/template files) and takes about
-four minutes on the CPU:
-
-```bat
-python -m tools.convert --model E:\LLM\qwen38-config --recipe qwen3_8_27b_a8 ^
-  --source reference=E:\LLM\qwen3_8_27b.ninfer --source dflash2=E:\LLM\dflash2-src ^
-  --components text,vision,mtp,dflash2 --name qwen3.8-27b --out E:\LLM\qwen3_8_27b_a8.ninfer
-```
-
-The [conversion guide](docs/weight-conversion.md) lists the files the configuration directory
-needs. Custom recipes and every option are in the
-[weight conversion guide](docs/weight-conversion.md).
-
-## Serving
-
-- **APIs.** OpenAI Chat Completions, OpenAI Responses (streaming, stored continuation state) and
-  Anthropic Messages; function tools are rendered into the prompt and parsed back as tool calls
-  (NInfer does not execute tools).
-- **Reasoning.** `reasoning_effort` (`low`, `medium`, `xhigh`, or `none`) and `enable_thinking`
-  on OpenAI routes; `thinking.budget_tokens` on Anthropic Messages or `--default-thinking-budget`
-  server-wide. Reasoning returns separately as `reasoning_content`.
-- **Prefix reuse.** Requests that extend or edit a previous conversation resume from the longest
-  compatible prefix. Automatic long anchors at the last message boundaries
-  (`--auto-long-anchors`) let an edited history restart below the edit instead of from zero.
-- **Session persistence.** `--slot-save-path DIR` enables llama.cpp-style
-  `POST /slots/{id}?action=save|restore|erase`, so a long session survives a server restart
-  (a 6.9K-token session restores in about 0.1 s); `--auto-save-evicted` spills evicted sessions.
-- **Observability.** `/monitor` (browser dashboard), `/metrics` (Prometheus, llama.cpp-compatible
-  names), `/slots`, llama.cpp-style `timings` on every response, and a per-request JSONL log with
-  the prefix-reuse decisions (`--request-log-jsonl FILE`).
-- **Admission.** Requests beyond the lanes wait in a bounded FIFO queue (`--max-pending-requests`,
-  `--pending-timeout-ms`); the default 30 s deadline is short for deep prefills.
-
-The full protocol reference, including every field and error code, is in
-[docs/serving.md](docs/serving.md).
+**Display.** If the 4060 Laptop also drives the monitor, the Windows compositor takes the GPU from
+CUDA every frame, costing 15-20 % of decode. Route the monitor to the integrated GPU if you can,
+otherwise use 60 Hz and keep animated windows still. Compare tok/s only between runs with the same
+display setup.
 
 ## Limits
 
-- One RTX 4090, one process, one resident model. No multi-GPU, no weight offload, no request
+- One RTX 4060 Laptop, one process, one resident model. No multi-GPU, no weight offload, no request
   preemption or priorities.
-- Prefill runs one request at a time; decode of other lanes waits while it runs.
-- With the official (BF16-prefill) Qwen3.8 artifact, prefill trails llama.cpp on short prompts;
-  the int8 artifact leads at every length ([Qwen3.8 performance](#qwen38-27b)). Bonsai prefill is
-  about 4x Prism's llama.cpp fork.
-- Long-context decode slows with depth: a Bonsai MTP round costs 18.5-20.8 ms at 128K against
-  12.8 ms at short context, all of it in attention.
-- `--kvmem-budget` keeps only a recency window (sink plus newest tail); retrieval scoring is not
-  implemented. It is ignored while `--spec` runs, disables prefix capture while active, and leaves
-  reuse-path prompts bounded by `--kv-capacity`.
-- DFlash2 is not supported with Bonsai's ternary output head; use MTP.
-- NVFP4/W4A4 execution needs Blackwell tensor cores and is unavailable on `sm_89`.
-- This branch is developed and validated on Windows. The Linux build and `Dockerfile` are
-  inherited from the upstream 4090 port and are not re-validated here; see
-  [docs/rtx-3090-linux.md](docs/rtx-3090-linux.md) with `CMAKE_CUDA_ARCHITECTURES=89`.
+- Qwen3.8-27B (19.0 GiB) needs KVMem + Host KV; Bonsai (6.4 GiB) is the recommended model here.
+- `--kvmem-budget` keeps a bounded Device window. Retrieval scoring is implemented but inert under
+  `--spec`, and MTP/draft pools are not windowed, so `--spec` keeps the dense path.
+- Window slides move pages synchronously across the Device/Host boundary, about 30 % of prefill
+  throughput in the 256K run.
+- `--host-kv-mib 0` does not auto-size with `--kv-ring` plus `--kvmem-budget`; pass an explicit size.
+- NVFP4/W4A4 needs Blackwell tensor cores and is unavailable on `sm_89`.
 
-## Documentation
+## Further reading
 
 | Topic | Document |
 |---|---|
 | All documentation | [docs/README.md](docs/README.md) |
 | CLI options | [docs/cli.md](docs/cli.md) |
 | HTTP server and protocols | [docs/serving.md](docs/serving.md) |
-| Windows build, Qwen3.8 measurements and experiments | [WINDOWS_PORT.md](WINDOWS_PORT.md) |
-| Ternary Bonsai design, kernels and measurements | [docs/maintainer/bonsai-ternary-design.md](docs/maintainer/bonsai-ternary-design.md) |
-| Ternary Bonsai conversion and tensor mapping | [docs/maintainer/bonsai-ternary-conversion.md](docs/maintainer/bonsai-ternary-conversion.md) |
-| Weight conversion and custom recipes | [docs/weight-conversion.md](docs/weight-conversion.md) |
-| Perplexity evaluation | [docs/perplexity.md](docs/perplexity.md) |
+| Windows build and measurements | [WINDOWS_PORT.md](WINDOWS_PORT.md) |
+| KVMem design and the 256K run | [docs/maintainer/kvmem-port.md](docs/maintainer/kvmem-port.md) |
+| Ternary Bonsai design and kernels | [docs/maintainer/bonsai-ternary-design.md](docs/maintainer/bonsai-ternary-design.md) |
+| Model conversion | [docs/maintainer/bonsai-ternary-conversion.md](docs/maintainer/bonsai-ternary-conversion.md), [docs/weight-conversion.md](docs/weight-conversion.md) |
 | Benchmarks and tests | [bench/README.md](bench/README.md), [tests/README.md](tests/README.md) |
-| Engine architecture | [docs/maintainer/engine-architecture.md](docs/maintainer/engine-architecture.md) |
-| Context cache and scheduling | [docs/maintainer/resource-scheduling-and-context-cache.md](docs/maintainer/resource-scheduling-and-context-cache.md) |
-| Comparison with llama.cpp (same machine, and the earlier Linux run) | [docs/llamacpp-comparison.md](docs/llamacpp-comparison.md) |
 
-## Lineage and credits
+## Credits
 
-This repository descends from a chain of ports; each added what the next one builds on:
+Native Windows build for the RTX 4060 Laptop, with Ternary Bonsai 2 27B (converter, ternary format
+and kernels, vision), n-gram speculation, concurrent lanes, DFlash2 verification routes, and the
+**KVMem** bounded Device KV working set with Host KV tiering.
 
-- [Neroued/ninfer](https://github.com/Neroued/ninfer) — the engine, developed for the RTX 5090
-  (`sm_120a`).
-- [Don-Chad/ninfer-3090](https://github.com/Don-Chad/ninfer-3090) — the `sm_86` compatibility
-  layer, ReplaySSM integration and Qwen3.8 runtime support
-  ([v0.6.1 release notes](RELEASE_NOTES_0.6.1.md)).
-- [sergiuszm/ninfer-4090](https://github.com/sergiuszm/ninfer-4090) — the `sm_89` RTX 4090 port:
-  Ada-tuned attention prefill, serving features (`/metrics`, `/slots`, slot save/restore,
-  automatic long anchors, request diagnostics).
-- [UDPSendToFailed/ninfer-4090](https://github.com/UDPSendToFailed/ninfer-4090) — the rotated and
-  E8-lattice KV modes (`rk8v4`, `rk4v4`, `rk4v4-e8`, `rk2v4-e8`) and the configurable vision
-  scratchpad, cherry-picked with authorship preserved
-  ([comparison](docs/udp-fork-comparison.md)).
-- [shantanusingh16/ninfer-4090](https://github.com/shantanusingh16/ninfer-4090) — llama.cpp-style
-  `timings` on chat completions.
-- This repository — the native Windows build, Ternary Bonsai 2 27B (converter, ternary format and
-  kernels, vision), n-gram speculation, the concurrent-lane and prefill work, and the Qwen3.8
-  DFlash2 verification routes.
-
-Ternary Bonsai 2 27B, its packings and Hadamard rotation are by [Prism ML](https://huggingface.co/prism-ml);
-their [llama.cpp fork](https://github.com/PrismML-Eng/llama.cpp) defined the formats this branch
-reads. [fraserprice/bonsai-vllm](https://github.com/fraserprice/bonsai-vllm) was a CUDA reference
-for the Hadamard kernel and a ternary tensor-core GEMM. The Bonsai port was developed with
-[Claude Code](https://claude.com/claude-code), with every kernel checked against FP64 oracles and
-every performance claim measured on the RTX 4090.
+Ternary Bonsai 2 27B, its packings and Hadamard rotation are by
+[Prism ML](https://huggingface.co/prism-ml); their
+[llama.cpp fork](https://github.com/PrismML-Eng/llama.cpp) defined the formats this branch reads.
 
 ## License
 
