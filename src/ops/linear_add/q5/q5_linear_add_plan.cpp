@@ -1,0 +1,249 @@
+#include "core/weight.h"
+#include "ops/linear_add/q5/q5_linear_add_plan.h"
+
+#include "core/layout.h"
+#include "ops/linear_add/q5/q5_linear_add_kernels.h"
+
+#include <array>
+#include <limits>
+#include <stdexcept>
+
+namespace ninfer::ops::detail {
+namespace {
+
+constexpr std::int32_t kAnyCols = std::numeric_limits<std::int32_t>::max();
+
+struct ColsSet {
+    std::int32_t first;
+    std::int32_t last;
+
+    constexpr bool contains(std::int32_t cols) const noexcept {
+        return cols >= first && cols <= last;
+    }
+};
+
+struct SupportSpec {
+    std::int32_t rows;
+    std::int32_t k;
+    std::int32_t padded_k;
+};
+
+struct RouteSpec {
+    ColsSet cols;
+    Q5LinearAddScheduleId schedule;
+};
+
+constexpr std::array<SupportSpec, 2> kSupports{{
+    {5120, 6144, 6144},
+    {5120, 17408, 17408},
+}};
+
+// T = 7..16 is the DFlash2 verification band (six to fifteen drafts); the SIMT split2 route read
+// the weights at ~350 GB/s there, and the 16-column MMA tile at k = 6144 measured ~96 us at
+// T = 14..16 against ~46 us for this route at 13 (WINDOWS_PORT.md, Qwen3.8 DFlash2 profile).
+constexpr std::array<RouteSpec, 7> kK6144Routes{{
+    {{1, 6}, Q5LinearAddScheduleId::Split2ExactResidual},
+    {{7, 16}, Q5LinearAddScheduleId::KSplitMmaResidual},
+    {{17, 32}, Q5LinearAddScheduleId::MmaResidualR64C16},
+    {{33, 48}, Q5LinearAddScheduleId::MmaResidualR64C24},
+    {{49, 192}, Q5LinearAddScheduleId::MmaResidualR64C32S4},
+    {{193, 512}, Q5LinearAddScheduleId::MmaResidualPipelinedR128C64},
+    {{513, kAnyCols}, Q5LinearAddScheduleId::MmaResidualPipelinedR128C64Tail},
+}};
+
+constexpr std::array<RouteSpec, 7> kK17408Routes{{
+    {{1, 6}, Q5LinearAddScheduleId::Split2ExactResidual},
+    {{7, 16}, Q5LinearAddScheduleId::KSplitMmaResidual},
+    {{17, 32}, Q5LinearAddScheduleId::MmaResidualR64C16},
+    {{33, 48}, Q5LinearAddScheduleId::MmaResidualR64C24},
+    {{49, 192}, Q5LinearAddScheduleId::MmaResidualR64C32S3},
+    {{193, 512}, Q5LinearAddScheduleId::MmaResidualPipelinedR128C64},
+    {{513, kAnyCols}, Q5LinearAddScheduleId::MmaResidualPipelinedR128C64Tail},
+}};
+
+template <std::size_t N>
+constexpr bool catalog_is_closed(const std::array<RouteSpec, N>& routes) noexcept {
+    std::int64_t expected = 1;
+    for (const RouteSpec& route : routes) {
+        if (route.cols.first != expected || route.cols.last < route.cols.first) { return false; }
+        expected = static_cast<std::int64_t>(route.cols.last) + 1;
+    }
+    return routes.back().cols.last == kAnyCols &&
+           expected == static_cast<std::int64_t>(kAnyCols) + 1;
+}
+
+static_assert(catalog_is_closed(kK6144Routes) && catalog_is_closed(kK17408Routes),
+              "Q5 LinearAdd routes must be exact, contiguous, and closed");
+
+// With an A8 permission, prefill widths from here on run the int8 GEMM; narrower extents
+// (decode and speculative verification) keep the A16 routes.
+constexpr std::int32_t kA8MinCols = 129;
+
+bool uses_a8(const Q5LinearAddProblem& problem) noexcept {
+    return allows_a8(problem.policy) && problem.cols >= kA8MinCols;
+}
+
+std::size_t a8_workspace_bytes(std::int32_t k, std::int32_t cols) {
+    WorkspaceLayoutBuilder layout;
+    (void)allocate_a8_g64_activation(layout, k, cols);
+    return layout.peak_bytes(1);
+}
+
+bool supported_shape(const Q5LinearAddProblem& problem) noexcept {
+    for (const SupportSpec& support : kSupports) {
+        if (problem.rows == support.rows && problem.k == support.k &&
+            problem.padded_k == support.padded_k) {
+            return true;
+        }
+    }
+    return false;
+}
+
+// The wide MMA launch loads one row-block of weights per column tile and costs whole waves of
+// column tiles: measured with the previous 64 x 128 staged-decode kernel, a 512-column launch
+// cost ~456 us at k=17408 and a 513-column launch ~934 us, i.e. the trailing mostly-empty tile
+// was billed as a full wave. Send up to 192 columns of remainder - the whole
+// narrow band - to the narrow routes instead, which stay under that wave for every T in it. A
+// wider remainder keeps the single wide launch: its tail needs a 128-wide tile of its own, which
+// costs the wave the composite is trying to avoid.
+constexpr std::int32_t kWaveCols       = 512;
+constexpr std::int32_t kNarrowTailCols = 192;
+
+void launch_wide_with_narrow_tail(const Tensor& x, const Weight& w, Tensor& residual_out,
+                                  WorkspaceArena& ws, cudaStream_t stream) {
+    const std::int32_t cols = x.ne[1];
+    const std::int32_t wide = (cols / kWaveCols) * kWaveCols;
+    const std::int32_t tail = cols - wide;
+    if (wide == 0 || tail == 0 || tail > kNarrowTailCols) {
+        q5_linear_add_mma_pipelined_r128_c64_launch(x, w, residual_out, stream);
+        return;
+    }
+
+    const Tensor x_wide = x.slice(1, 0, wide);
+    Tensor out_wide     = residual_out.slice(1, 0, wide);
+    q5_linear_add_mma_pipelined_r128_c64_launch(x_wide, w, out_wide, stream);
+
+    const Tensor x_tail = x.slice(1, wide, tail);
+    Tensor out_tail     = residual_out.slice(1, wide, tail);
+    q5_linear_add_dispatch(x_tail, w, out_tail, LinearPolicy::A16Only, ws, stream);
+}
+
+} // namespace
+
+const char* q5_linear_add_schedule_name(Q5LinearAddScheduleId schedule) noexcept {
+    switch (schedule) {
+    case Q5LinearAddScheduleId::Split2ExactResidual:
+        return "linear_add.q5.simt.split2.exact.residual";
+    case Q5LinearAddScheduleId::KSplitMmaResidual:
+        return "linear_add.q5.mma.ksplit.r16.residual";
+    case Q5LinearAddScheduleId::MmaResidualR64C16:
+        return "linear_add.q5.mma.r64.c16.cta_collective_residual";
+    case Q5LinearAddScheduleId::MmaResidualR64C24:
+        return "linear_add.q5.mma.r64.c24.cta_collective_residual";
+    case Q5LinearAddScheduleId::MmaResidualR64C32S3:
+        return "linear_add.q5.mma.r64.c32.s3.cta_collective_residual";
+    case Q5LinearAddScheduleId::MmaResidualR64C32S4:
+        return "linear_add.q5.mma.r64.c32.s4.cta_collective_residual";
+    case Q5LinearAddScheduleId::MmaResidualPipelinedR128C64:
+        return "linear_add.q5.mma.pipelined.r128.c64.residual";
+    case Q5LinearAddScheduleId::MmaResidualPipelinedR128C64Tail:
+        return "linear_add.q5.mma.pipelined.r128.c64.residual.narrow_tail";
+    case Q5LinearAddScheduleId::A8MmaResidualPipelinedR128C64:
+        return "linear_add.q5.a8.mma.pipelined.r128.c64.residual";
+    }
+    return "linear_add.q5.unknown";
+}
+
+bool q5_linear_add_admits(const Q5LinearAddProblem& problem) noexcept {
+    switch (problem.policy) {
+    case LinearPolicy::A16Only:
+    case LinearPolicy::AllowA8:
+    case LinearPolicy::AllowA4:
+        return supported_shape(problem) && problem.cols >= 1;
+    }
+    return false;
+}
+
+Q5LinearAddPlan q5_linear_add_resolve_plan(const Q5LinearAddProblem& problem) {
+    if (!q5_linear_add_admits(problem)) {
+        throw std::invalid_argument("q5 linear_add: exact problem or column count is not admitted");
+    }
+    if (uses_a8(problem)) {
+        return {Q5LinearAddScheduleId::A8MmaResidualPipelinedR128C64,
+                a8_workspace_bytes(problem.k, problem.cols)};
+    }
+
+    const auto resolve_from = [&](const auto& routes) -> Q5LinearAddPlan {
+        for (const RouteSpec& route : routes) {
+            if (route.cols.contains(problem.cols)) { return {route.schedule, 0}; }
+        }
+        throw std::logic_error("q5 linear_add: admitted problem has no covering route");
+    };
+    return problem.k == 6144 ? resolve_from(kK6144Routes) : resolve_from(kK17408Routes);
+}
+
+std::size_t q5_linear_add_capacity_workspace_bytes(std::int32_t rows, std::int32_t k,
+                                                   std::int32_t padded_k, LinearPolicy policy,
+                                                   std::int32_t min_cols, std::int32_t max_cols) {
+    if (min_cols <= 0 || max_cols < min_cols) {
+        throw std::invalid_argument("q5 linear_add: invalid column interval");
+    }
+    (void)q5_linear_add_resolve_plan({rows, k, padded_k, min_cols, policy});
+    // Only the A8 route has scratch, and it grows with the width.
+    return q5_linear_add_resolve_plan({rows, k, padded_k, max_cols, policy}).workspace_bytes;
+}
+
+void q5_linear_add_execute_plan(const Q5LinearAddPlan& plan, const Tensor& x, const Weight& w,
+                                Tensor& residual_out, LinearPolicy policy, WorkspaceArena& ws,
+                                cudaStream_t stream) {
+    const Q5LinearAddProblem problem{residual_out.ne[0], x.ne[0], w.padded_shape[1], x.ne[1],
+                                     policy};
+    const Q5LinearAddPlan resolved = q5_linear_add_resolve_plan(problem);
+    if (resolved.schedule != plan.schedule || resolved.workspace_bytes != plan.workspace_bytes) {
+        throw std::invalid_argument("q5 linear_add: plan does not match the exact problem");
+    }
+    switch (plan.schedule) {
+    case Q5LinearAddScheduleId::Split2ExactResidual:
+        q5_linear_add_split2_exact_launch(x, w, residual_out, stream);
+        return;
+    case Q5LinearAddScheduleId::KSplitMmaResidual:
+        q5_linear_add_ksplit_mma_launch(x, w, residual_out, stream);
+        return;
+    case Q5LinearAddScheduleId::MmaResidualR64C16:
+        q5_linear_add_mma_r64_c16_launch(x, w, residual_out, stream);
+        return;
+    case Q5LinearAddScheduleId::MmaResidualR64C24:
+        q5_linear_add_mma_r64_c24_launch(x, w, residual_out, stream);
+        return;
+    case Q5LinearAddScheduleId::MmaResidualR64C32S3:
+        q5_linear_add_mma_r64_c32_s3_launch(x, w, residual_out, stream);
+        return;
+    case Q5LinearAddScheduleId::MmaResidualR64C32S4:
+        q5_linear_add_mma_r64_c32_s4_launch(x, w, residual_out, stream);
+        return;
+    case Q5LinearAddScheduleId::MmaResidualPipelinedR128C64:
+        q5_linear_add_mma_pipelined_r128_c64_launch(x, w, residual_out, stream);
+        return;
+    case Q5LinearAddScheduleId::MmaResidualPipelinedR128C64Tail:
+        launch_wide_with_narrow_tail(x, w, residual_out, ws, stream);
+        return;
+    case Q5LinearAddScheduleId::A8MmaResidualPipelinedR128C64: {
+        auto scratch_scope        = ws.scope();
+        A8G64Activation quantized = allocate_a8_g64_activation(ws, problem.k, problem.cols);
+        a8_g64_quantize(x, quantized, stream);
+        q5_linear_add_a8_mma_pipelined_r128_c64_launch(quantized, w, residual_out, stream);
+        return;
+    }
+    }
+    throw std::logic_error("q5 linear_add: unknown schedule");
+}
+
+void q5_linear_add_dispatch(const Tensor& x, const Weight& w, Tensor& residual_out,
+                            LinearPolicy policy, WorkspaceArena& ws, cudaStream_t stream) {
+    const Q5LinearAddProblem problem{residual_out.ne[0], x.ne[0], w.padded_shape[1], x.ne[1],
+                                     policy};
+    const Q5LinearAddPlan plan = q5_linear_add_resolve_plan(problem);
+    q5_linear_add_execute_plan(plan, x, w, residual_out, policy, ws, stream);
+}
+
+} // namespace ninfer::ops::detail

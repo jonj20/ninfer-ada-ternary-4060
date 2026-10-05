@@ -1,0 +1,115 @@
+#pragma once
+
+#include <cuda_runtime.h>
+
+#include <cstddef>
+#include <cstdint>
+
+namespace ninfer {
+
+void cuda_check(cudaError_t err, const char* expr, const char* file, int line);
+
+#define CUDA_CHECK(expr) ::ninfer::cuda_check((expr), #expr, __FILE__, __LINE__)
+
+// Streaming-multiprocessor count of the device this process runs on, queried once and
+// cached. Launch geometry that deliberately fills exactly one resident wave reads the count
+// from here instead of a hardcoded literal -- several launchers used to assume 170 SMs
+// (the upstream RTX 5090 target), which on this fork's RTX 4090 (128 SMs) leaves a
+// straggler wave running at a fraction of the GPU's width. The product runs one resident
+// model on one device, so a single cached query is the whole device set.
+int device_sm_count();
+
+// Compile-time mirror of device_sm_count() for the architecture this build targets.
+// __device__ launch policies cannot query the runtime, and the host launcher that must
+// reproduce such a policy exactly has to agree with it at compile time; those two sites use
+// this constant, every other site uses device_sm_count(). The top-level CMakeLists.txt
+// enforces CMAKE_CUDA_ARCHITECTURES=89, so unlike upstream forks that also target sm_86,
+// this is just one literal, not an architecture switch.
+inline constexpr int kTargetSmCount = 128; // NVIDIA GeForce RTX 4090 (sm_89)
+
+// Stream-ordered copy of `bytes` from `source` to `destination` by a kernel rather than a
+// copy-engine operation. Either side may be pinned host memory (cudaMallocHost, mapped under
+// unified addressing), which the kernel reads or writes over PCIe. Decode rounds use it for their
+// small ingress, egress and hidden-state copies: in a CUDA Graph on this WDDM RTX 4090 every
+// switch between a kernel node and a copy-engine node left the GPU idle for 15-35 us.
+void kernel_copy_async(void* destination, const void* source, std::size_t bytes,
+                       cudaStream_t stream);
+
+// Non-owning execution facts passed to Ops whose launch policy depends on physical device
+// capacity. DeviceContext remains the owner and authoritative source of both values.
+struct DeviceExecutionView {
+    cudaStream_t stream               = nullptr;
+    std::int32_t multiprocessor_count = 0;
+};
+
+struct DeviceContext {
+    int device                   = 0;
+    cudaStream_t stream          = nullptr;
+    cudaStream_t transfer_stream = nullptr;
+    cudaDeviceProp props{};
+
+    explicit DeviceContext(int device_id = 0);
+    ~DeviceContext();
+
+    DeviceContext(const DeviceContext&)            = delete;
+    DeviceContext& operator=(const DeviceContext&) = delete;
+    DeviceContext(DeviceContext&& other) noexcept;
+    DeviceContext& operator=(DeviceContext&& other) noexcept;
+
+    void bind_to_current_thread() const;
+    void bind_to_current_thread_noexcept() const noexcept;
+    int compute_capability() const noexcept;
+    int multiprocessor_count() const noexcept;
+    DeviceExecutionView execution_view() const noexcept;
+    std::size_t total_vram() const noexcept;
+    void synchronize() const;
+    // Submits the stream's queued work without waiting for it (WDDM batches launches until the
+    // stream is queried or synchronized) and reports an error it has already raised.
+    void flush() const;
+};
+
+class CudaEventTimer {
+public:
+    explicit CudaEventTimer(const DeviceContext& ctx);
+    CudaEventTimer(const DeviceContext& ctx, cudaStream_t stream);
+    ~CudaEventTimer();
+
+    CudaEventTimer(const CudaEventTimer&)            = delete;
+    CudaEventTimer& operator=(const CudaEventTimer&) = delete;
+    CudaEventTimer(CudaEventTimer&& other) noexcept;
+    CudaEventTimer& operator=(CudaEventTimer&& other) noexcept;
+
+    void start();
+    void record_stop();
+    [[nodiscard]] float elapsed_ms() const;
+    float stop_ms();
+
+private:
+    cudaStream_t stream_ = nullptr;
+    cudaEvent_t start_   = nullptr;
+    cudaEvent_t stop_    = nullptr;
+};
+
+// Reusable non-timing event for worker-driven asynchronous control transactions. The owning
+// component records it after enqueueing one transfer batch and polls it from later boundaries.
+class CudaCompletionEvent {
+public:
+    explicit CudaCompletionEvent(const DeviceContext& ctx);
+    ~CudaCompletionEvent();
+
+    CudaCompletionEvent(const CudaCompletionEvent&)            = delete;
+    CudaCompletionEvent& operator=(const CudaCompletionEvent&) = delete;
+    CudaCompletionEvent(CudaCompletionEvent&& other) noexcept;
+    CudaCompletionEvent& operator=(CudaCompletionEvent&& other) noexcept;
+
+    void record(cudaStream_t stream);
+    void wait(cudaStream_t stream) const;
+    [[nodiscard]] bool ready() const;
+    void synchronize() const;
+
+private:
+    int device_        = 0;
+    cudaEvent_t event_ = nullptr;
+};
+
+} // namespace ninfer
